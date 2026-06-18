@@ -75,7 +75,7 @@ ZSCORE_THRESHOLD  = 2.0     # Confirmación: precio a 2σ de la media
 ZSCORE_PERIOD     = 20      # Ventana para calcular Z-Score
 EMA_TREND_PERIOD  = 50      # EMA para determinar tendencia
 ADX_PERIOD        = 14      # ADX para detección de régimen
-ADX_THRESHOLD     = 25      # ADX < 25 = mercado lateral (ideal para MR)
+ADX_THRESHOLD     = 30      # ADX < 30 = mercado lateral + semi-lateral
 
 # ── Risk Management ──
 LEVERAGE          = 7
