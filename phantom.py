@@ -1,9 +1,15 @@
 """
-phantom.py — Phantom Bot v1.1
+phantom.py — Phantom Bot v1.2
 Wino and Company · Junio 2026
 
 ESTRATEGIA: Statistical Mean-Reversion con Detección de Régimen
 ═════════════════════════════════════════════════════════════════
+
+v1.2 CHANGELOG (18-Jun-2026):
+  - Trend filter: GATE → BIAS (ya no bloquea entradas counter-trend)
+  - Counter-trend entries ejecutan con confianza reducida (-15pts)
+  - With-trend entries mantienen bonus completo (+15pts)
+  - Fix: catch-22 donde RSI extremo forzaba price past EMA50
 
 v1.1 CHANGELOG (18-Jun-2026):
   - Timeframe: 15m → 1H (reduce ruido, EMA50=50h sticky, Z-Score=20h robusto)
@@ -11,22 +17,16 @@ v1.1 CHANGELOG (18-Jun-2026):
   - Kline limit: 100 → 200 (más data para cálculos en 1H)
   - Activos: +ETH-USDT (mayor superficie de señales)
   - Logging: NEAR MISS cuando 2/3 condiciones se cumplen
-  - Fix: contradicción estructural en 15m donde Z < -2.0 forzaba price < EMA50
-
-FUNDAMENTO MATEMÁTICO:
-  - RSI(2) de Larry Connors: 75%+ win rate documentado en 34 años de backtests
-  - Z-Score estadístico: mide desviaciones estándar del precio vs media
-  - Detección de régimen: ADX determina si el mercado está en rango (mean-revert)
-    o en tendencia (no operar mean-reversion)
 
 LÓGICA CORE:
   1. Régimen: ADX < 30 = mercado lateral → mean-reversion activo
                 ADX >= 30 = mercado en tendencia → NO operar (esperar)
-  2. Trend filter: EMA50 (1H = 50 horas) determina uptrend o downtrend
-  3. Señal: RSI(2) < 10 en uptrend → BUY (pullback en tendencia alcista)
-           RSI(2) > 90 en downtrend → SELL (bounce en tendencia bajista)
-  4. Confirmación: Z-Score > 1.5 desviaciones del precio vs media
-  5. Salida: RSI(2) cruza 60 (BUY) o 40 (SELL) — NO target fijo
+  2. Señal: RSI(2) < 10 + Z-Score < -1.5σ → BUY (oversold extremo)
+           RSI(2) > 90 + Z-Score > +1.5σ → SELL (overbought extremo)
+  3. Trend EMA50: modifica confidence score, NO bloquea entrada
+     - With-trend: +15pts confianza
+     - Counter-trend: -15pts confianza (penalidad, no bloqueo)
+  4. Salida: RSI(2) cruza 60 (BUY) o 40 (SELL) — NO target fijo
 
 ACTIVOS: BTC-USDT, SOL-USDT, ETH-USDT (BingX auto) + NVDA (Telegram/Quantfury)
 OBJETIVO: +1-2% diario sobre capital disponible
@@ -325,11 +325,11 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     """
     Evalúa si hay señal de mean-reversion.
     
-    Reglas (v1.1 — 1H candles):
+    Reglas (v1.2 — trend como bias):
     1. ADX < 30 → mercado en rango (condición necesaria)
-    2. RSI(2) < 10 + precio > EMA50 → BUY (pullback en uptrend)
-    3. RSI(2) > 90 + precio < EMA50 → SELL (bounce en downtrend)
-    4. Z-Score confirma extremo estadístico (|Z| > 1.5σ)
+    2. RSI(2) < 10 + Z < -1.5σ → BUY (oversold extremo)
+    3. RSI(2) > 90 + Z > +1.5σ → SELL (overbought extremo)
+    4. Trend EMA50: ajusta confidence (+15 with-trend, -15 counter-trend)
     5. Slippage check antes de ejecutar
     """
     if len(klines) < max(KLINE_LIMIT, EMA_TREND_PERIOD + 10):
@@ -370,32 +370,22 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     if symbol in _positions:
         return None
     
-    # ── Regla 2: Señal de entrada ──
+    # ── Regla 2: Señal de entrada (v1.2: trend = bias, no gate) ──
     action = None
     
-    if rsi < RSI_OVERSOLD and trend == "BULLISH" and zscore < -ZSCORE_THRESHOLD:
+    if rsi < RSI_OVERSOLD and zscore < -ZSCORE_THRESHOLD:
         action = "BUY"
-    elif rsi > RSI_OVERBOUGHT and trend == "BEARISH" and zscore > ZSCORE_THRESHOLD:
+    elif rsi > RSI_OVERBOUGHT and zscore > ZSCORE_THRESHOLD:
         action = "SELL"
     
+    # Determinar si es with-trend o counter-trend
+    with_trend = False
+    if action == "BUY" and trend == "BULLISH":
+        with_trend = True
+    elif action == "SELL" and trend == "BEARISH":
+        with_trend = True
+    
     if not action:
-        # ── NEAR MISS: log cuando 2/3 condiciones se cumplen ──
-        buy_conds = [rsi < RSI_OVERSOLD, trend == "BULLISH", zscore < -ZSCORE_THRESHOLD]
-        sell_conds = [rsi > RSI_OVERBOUGHT, trend == "BEARISH", zscore > ZSCORE_THRESHOLD]
-        buy_met = sum(buy_conds)
-        sell_met = sum(sell_conds)
-        if buy_met == 2:
-            missing = []
-            if not buy_conds[0]: missing.append(f"RSI={rsi:.1f} > {RSI_OVERSOLD}")
-            if not buy_conds[1]: missing.append(f"Trend={trend} ≠ BULLISH")
-            if not buy_conds[2]: missing.append(f"Z={zscore:+.2f} > -{ZSCORE_THRESHOLD}")
-            logger.info(f"[NEAR MISS] {symbol} BUY 2/3 — falta: {', '.join(missing)}")
-        elif sell_met == 2:
-            missing = []
-            if not sell_conds[0]: missing.append(f"RSI={rsi:.1f} < {RSI_OVERBOUGHT}")
-            if not sell_conds[1]: missing.append(f"Trend={trend} ≠ BEARISH")
-            if not sell_conds[2]: missing.append(f"Z={zscore:+.2f} < +{ZSCORE_THRESHOLD}")
-            logger.info(f"[NEAR MISS] {symbol} SELL 2/3 — falta: {', '.join(missing)}")
         return None
     
     # ── SL basado en ATR ──
@@ -428,9 +418,9 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     # ADX score (20pts): ADX<15 = max (muy lateral), ADX=25 = 0
     adx_score = max(0, min(20, (25 - adx) / 10 * 20))
     
-    # Trend alignment (15pts): distancia precio vs EMA como % de ATR
-    ema_dist = abs(price - ema_now) / atr if atr > 0 else 0
-    trend_score = max(0, min(15, ema_dist / 3 * 15))
+    # Trend alignment (15pts): v1.2 BIAS — with-trend = +15, counter-trend = -15
+    trend_score = 15 if with_trend else -15
+    trend_label = "WITH" if with_trend else "COUNTER"
     
     # Volatilidad (10pts): ATR estable = bueno (comparar últimas 5 vs 14)
     recent_atr = calc_atr(klines, 5)
@@ -443,7 +433,7 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     logger.info(
         f"[SIGNAL] 🎯 {action} {symbol} @ ${price:,.2f} | "
         f"RSI2={rsi:.1f} Z={zscore:+.2f} ADX={adx:.1f} | "
-        f"SL=${sl:,.2f} ({sl_pct:.2f}%) | {trend} {regime} | "
+        f"SL=${sl:,.2f} ({sl_pct:.2f}%) | {trend} {regime} [{trend_label}-TREND] | "
         f"Score={confidence}/100 [RSI={rsi_score:.0f} Z={z_score_pts:.0f} ADX={adx_score:.0f} T={trend_score:.0f} V={vol_score:.0f}]"
     )
     
@@ -458,6 +448,7 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
         "adx": adx,
         "atr": atr,
         "trend": trend,
+        "trend_label": trend_label,
         "regime": regime,
         "confidence": confidence,
     }
@@ -689,7 +680,7 @@ def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: s
         f"📈 RSI(2):  {signal['rsi']:.1f}\n"
         f"📐 Z-Score: {signal['zscore']:+.2f}σ\n"
         f"📊 ADX:     {signal['adx']:.1f} ({signal['regime']})\n"
-        f"📈 Trend:   {signal['trend']}\n"
+        f"📈 Trend:   {signal['trend']} [{signal.get('trend_label', 'N/A')}-TREND]\n"
         f"{'━' * 24}\n"
         f"🎯 Score:   {conf}/100 [{bar}]\n"
         f"🔮 Pronóstico: {pronostico}\n"
@@ -714,9 +705,10 @@ def tg_close_alert(symbol: str, pos: dict, close_price: float, pnl: float, reaso
 
 def tg_startup(balance: float):
     tg_send(
-        f"👻 <b>PHANTOM v1.1 iniciado</b>\n"
+        f"👻 <b>PHANTOM v1.2 iniciado</b>\n"
         f"{'━' * 24}\n"
         f"Estrategia: Mean-Reversion (RSI2 + Z-Score)\n"
+        f"Trend: BIAS (no bloquea counter-trend)\n"
         f"Timeframe: {KLINE_TIMEFRAME} | Eval: {EVAL_INTERVAL//60}min\n"
         f"Activos: {', '.join(CRYPTO_PAIRS)} + {STOCK_SYMBOL}\n"
         f"Balance: ${balance:,.2f}\n"
@@ -772,7 +764,7 @@ def main_loop():
     
     _start_balance = get_balance()
     logger.info("=" * 60)
-    logger.info("PHANTOM v1.1 — Wino and Company")
+    logger.info("PHANTOM v1.2 — Wino and Company")
     logger.info(f"Balance: ${_start_balance:,.2f}")
     logger.info(f"Activos: {CRYPTO_PAIRS} + {STOCK_SYMBOL}")
     logger.info(f"Estrategia: Mean-Reversion RSI(2) + Z-Score + ADX Regime")
