@@ -389,10 +389,44 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     
     sl_pct = sl_distance / price * 100
     
+    # ── CONFIDENCE SCORE (0-100) ──
+    # Factores ponderados:
+    #   RSI extremo (30pts): más extremo = más confianza
+    #   Z-Score profundidad (25pts): más desviaciones = más confianza
+    #   ADX bajo (20pts): más lateral = mejor para mean-reversion
+    #   Trend alignment (15pts): precio bien apoyado en EMA
+    #   Volatilidad estable (10pts): ATR no inflado
+    
+    # RSI score (30pts): RSI<5 o >95 = max, RSI=10/90 = min
+    if action == "BUY":
+        rsi_score = max(0, min(30, (10 - rsi) / 10 * 30))
+    else:
+        rsi_score = max(0, min(30, (rsi - 90) / 10 * 30))
+    
+    # Z-Score score (25pts): |Z|>3 = max, |Z|=2 = min
+    z_abs = abs(zscore)
+    z_score_pts = max(0, min(25, (z_abs - 2.0) / 1.5 * 25))
+    
+    # ADX score (20pts): ADX<15 = max (muy lateral), ADX=25 = 0
+    adx_score = max(0, min(20, (25 - adx) / 10 * 20))
+    
+    # Trend alignment (15pts): distancia precio vs EMA como % de ATR
+    ema_dist = abs(price - ema_now) / atr if atr > 0 else 0
+    trend_score = max(0, min(15, ema_dist / 3 * 15))
+    
+    # Volatilidad (10pts): ATR estable = bueno (comparar últimas 5 vs 14)
+    recent_atr = calc_atr(klines, 5)
+    atr_ratio = recent_atr / atr if atr > 0 else 1
+    vol_score = max(0, min(10, (2 - abs(atr_ratio - 1) * 5) * 5))
+    
+    confidence = round(rsi_score + z_score_pts + adx_score + trend_score + vol_score)
+    confidence = max(0, min(100, confidence))
+    
     logger.info(
         f"[SIGNAL] 🎯 {action} {symbol} @ ${price:,.2f} | "
         f"RSI2={rsi:.1f} Z={zscore:+.2f} ADX={adx:.1f} | "
-        f"SL=${sl:,.2f} ({sl_pct:.2f}%) | {trend} {regime}"
+        f"SL=${sl:,.2f} ({sl_pct:.2f}%) | {trend} {regime} | "
+        f"Score={confidence}/100 [RSI={rsi_score:.0f} Z={z_score_pts:.0f} ADX={adx_score:.0f} T={trend_score:.0f} V={vol_score:.0f}]"
     )
     
     return {
@@ -407,6 +441,7 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
         "atr": atr,
         "trend": trend,
         "regime": regime,
+        "confidence": confidence,
     }
 
 
@@ -610,6 +645,21 @@ def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: s
     emoji = "🟢" if signal["action"] == "BUY" else "🔴"
     side = "LONG" if signal["action"] == "BUY" else "SHORT"
     sl_pct = abs(fill - sl) / fill * 100
+    conf = signal.get("confidence", 0)
+    
+    # Score visual bar
+    filled = round(conf / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    
+    # Pronostico basado en score
+    if conf >= 80:
+        pronostico = "EXCELENTE"
+    elif conf >= 65:
+        pronostico = "FAVORABLE"
+    elif conf >= 50:
+        pronostico = "MODERADO"
+    else:
+        pronostico = "BAJO"
     
     msg = (
         f"{emoji} <b>PHANTOM — {side} {signal['symbol']}</b>\n"
@@ -622,6 +672,9 @@ def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: s
         f"📐 Z-Score: {signal['zscore']:+.2f}σ\n"
         f"📊 ADX:     {signal['adx']:.1f} ({signal['regime']})\n"
         f"📈 Trend:   {signal['trend']}\n"
+        f"{'━' * 24}\n"
+        f"🎯 Score:   {conf}/100 [{bar}]\n"
+        f"🔮 Pronóstico: {pronostico}\n"
         f"{'━' * 24}\n"
         f"💰 Margin: ${margin:.2f} | Venue: {venue}\n"
         f"⏱ {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
