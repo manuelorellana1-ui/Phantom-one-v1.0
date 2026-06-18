@@ -589,15 +589,21 @@ def close_crypto(symbol: str, reason: str) -> float:
 
 def tg_send(msg: str) -> bool:
     if not TG_TOKEN or not TG_CHAT_ID:
+        logger.warning("[TG] Token o chat_id vacío — no se puede enviar")
         return False
     try:
+        chat = TG_CHAT_ID.strip()
         r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            f"https://api.telegram.org/bot{TG_TOKEN.strip()}/sendMessage",
+            json={"chat_id": chat, "text": msg, "parse_mode": "HTML"},
             timeout=10,
         )
-        return r.status_code == 200
-    except:
+        if r.status_code != 200:
+            logger.error(f"[TG] Error {r.status_code}: {r.text[:300]}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"[TG] Exception: {e}")
         return False
 
 def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: str):
