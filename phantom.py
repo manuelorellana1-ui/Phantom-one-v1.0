@@ -19,8 +19,8 @@ v1.1 CHANGELOG (18-Jun-2026):
   - Logging: NEAR MISS cuando 2/3 condiciones se cumplen
 
 LÓGICA CORE:
-  1. Régimen: ADX < 30 = mercado lateral → mean-reversion activo
-                ADX >= 30 = mercado en tendencia → NO operar (esperar)
+  1. Régimen: ADX < 40 = mercado lateral/semi-trending → mean-reversion activo
+                ADX >= 40 = tendencia fuerte → NO operar (esperar)
   2. Señal: RSI(2) < 10 + Z-Score < -1.5σ → BUY (oversold extremo)
            RSI(2) > 90 + Z-Score > +1.5σ → SELL (overbought extremo)
   3. Trend EMA50: modifica confidence score, NO bloquea entrada
@@ -76,7 +76,7 @@ ZSCORE_THRESHOLD  = 1.5     # Confirmación: precio a 1.5σ de la media (v1.1: b
 ZSCORE_PERIOD     = 20      # Ventana para calcular Z-Score
 EMA_TREND_PERIOD  = 50      # EMA para determinar tendencia
 ADX_PERIOD        = 14      # ADX para detección de régimen
-ADX_THRESHOLD     = 30      # ADX < 30 = mercado lateral + semi-lateral
+ADX_THRESHOLD     = 40      # ADX < 40 = lateral + semi-trending (v1.2: era 30)
 
 # ── Risk Management ──
 LEVERAGE          = 7
@@ -326,7 +326,7 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     Evalúa si hay señal de mean-reversion.
     
     Reglas (v1.2 — trend como bias):
-    1. ADX < 30 → mercado en rango (condición necesaria)
+    1. ADX < 40 → mercado en rango o semi-trending (condición necesaria)
     2. RSI(2) < 10 + Z < -1.5σ → BUY (oversold extremo)
     3. RSI(2) > 90 + Z > +1.5σ → SELL (overbought extremo)
     4. Trend EMA50: ajusta confidence (+15 with-trend, -15 counter-trend)
