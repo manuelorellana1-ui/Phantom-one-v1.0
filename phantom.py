@@ -1,9 +1,17 @@
 """
-phantom.py — Phantom Bot v1.0
+phantom.py — Phantom Bot v1.1
 Wino and Company · Junio 2026
 
 ESTRATEGIA: Statistical Mean-Reversion con Detección de Régimen
 ═════════════════════════════════════════════════════════════════
+
+v1.1 CHANGELOG (18-Jun-2026):
+  - Timeframe: 15m → 1H (reduce ruido, EMA50=50h sticky, Z-Score=20h robusto)
+  - Z-Score threshold: 2.0σ → 1.5σ (compensa menor volatilidad intra-candle 1H)
+  - Kline limit: 100 → 200 (más data para cálculos en 1H)
+  - Activos: +ETH-USDT (mayor superficie de señales)
+  - Logging: NEAR MISS cuando 2/3 condiciones se cumplen
+  - Fix: contradicción estructural en 15m donde Z < -2.0 forzaba price < EMA50
 
 FUNDAMENTO MATEMÁTICO:
   - RSI(2) de Larry Connors: 75%+ win rate documentado en 34 años de backtests
@@ -12,23 +20,16 @@ FUNDAMENTO MATEMÁTICO:
     o en tendencia (no operar mean-reversion)
 
 LÓGICA CORE:
-  1. Régimen: ADX < 25 = mercado lateral → mean-reversion activo
-                ADX >= 25 = mercado en tendencia → NO operar (esperar)
-  2. Trend filter: EMA50 determina si estamos en uptrend o downtrend
-  3. Señal: RSI(2) < 10 en uptrend → BUY (oversold en tendencia alcista)
-           RSI(2) > 90 en downtrend → SELL (overbought en tendencia bajista)
-  4. Confirmación: Z-Score > 2.0 desviaciones del precio vs media
+  1. Régimen: ADX < 30 = mercado lateral → mean-reversion activo
+                ADX >= 30 = mercado en tendencia → NO operar (esperar)
+  2. Trend filter: EMA50 (1H = 50 horas) determina uptrend o downtrend
+  3. Señal: RSI(2) < 10 en uptrend → BUY (pullback en tendencia alcista)
+           RSI(2) > 90 en downtrend → SELL (bounce en tendencia bajista)
+  4. Confirmación: Z-Score > 1.5 desviaciones del precio vs media
   5. Salida: RSI(2) cruza 60 (BUY) o 40 (SELL) — NO target fijo
 
-DIFERENCIAS CLAVE vs WinoBot/Scalpers:
-  - NO persigue breakouts (compra DESPUÉS de caídas, no después de subidas)
-  - NO usa market orders agresivos (usa limit orders al close de la vela)
-  - NO tiene TP fijo (sale cuando RSI vuelve a zona neutral = el mercado decide)
-  - SL basado en ATR × 3.0 (fuera del ruido, no dentro)
-  - Evalúa cada 15 minutos (no cada 60 segundos)
-
-ACTIVOS: BTC-USDT, SOL-USDT (BingX auto) + NVDA (Telegram/Quantfury)
-OBJETIVO: +2% diario sobre capital disponible
+ACTIVOS: BTC-USDT, SOL-USDT, ETH-USDT (BingX auto) + NVDA (Telegram/Quantfury)
+OBJETIVO: +1-2% diario sobre capital disponible
 """
 
 import os
@@ -62,7 +63,7 @@ TG_TOKEN         = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Activos ──
-CRYPTO_PAIRS = ["BTC-USDT", "SOL-USDT"]
+CRYPTO_PAIRS = ["BTC-USDT", "SOL-USDT", "ETH-USDT"]
 STOCK_SYMBOL = "NVDA"
 
 # ── Estrategia ──
@@ -71,7 +72,7 @@ RSI_OVERSOLD      = 10      # Comprar cuando RSI < 10 (extremo)
 RSI_OVERBOUGHT    = 90      # Vender cuando RSI > 90 (extremo)
 RSI_EXIT_LONG     = 60      # Salir de LONG cuando RSI > 60
 RSI_EXIT_SHORT    = 40      # Salir de SHORT cuando RSI < 40
-ZSCORE_THRESHOLD  = 2.0     # Confirmación: precio a 2σ de la media
+ZSCORE_THRESHOLD  = 1.5     # Confirmación: precio a 1.5σ de la media (v1.1: bajado de 2.0)
 ZSCORE_PERIOD     = 20      # Ventana para calcular Z-Score
 EMA_TREND_PERIOD  = 50      # EMA para determinar tendencia
 ADX_PERIOD        = 14      # ADX para detección de régimen
@@ -86,9 +87,9 @@ DAILY_LOSS_LIMIT  = 0.03    # -3% del capital = stop trading hoy
 MAX_SLIPPAGE_PCT  = 0.003   # 0.3% max slippage permitido
 
 # ── Evaluación ──
-EVAL_INTERVAL     = 900     # Evaluar cada 15 minutos (900 segundos)
-KLINE_TIMEFRAME   = "15m"   # Velas de 15 minutos
-KLINE_LIMIT       = 100     # Últimas 100 velas
+EVAL_INTERVAL     = 900     # Evaluar cada 15 minutos (captura candle 1H formándose)
+KLINE_TIMEFRAME   = "1h"    # Velas de 1 hora (v1.1: era 15m)
+KLINE_LIMIT       = 200     # Últimas 200 velas (v1.1: era 100)
 
 # ── BingX API ──
 BINGX_BASE = "https://open-api.bingx.com"
@@ -158,9 +159,9 @@ def get_klines(symbol: str, interval: str = KLINE_TIMEFRAME, limit: int = KLINE_
     return klines
 
 def get_nvda_klines() -> List[dict]:
-    """Obtiene velas 15m de NVDA via Yahoo Finance."""
+    """Obtiene velas 1h de NVDA via Yahoo Finance."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{STOCK_SYMBOL}"
-    params = {"interval": "15m", "range": "5d", "includePrePost": "false"}
+    params = {"interval": "1h", "range": "10d", "includePrePost": "false"}
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         r = requests.get(url, params=params, headers=headers, timeout=10)
@@ -324,11 +325,11 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     """
     Evalúa si hay señal de mean-reversion.
     
-    Reglas:
-    1. ADX < 25 → mercado en rango (condición necesaria)
+    Reglas (v1.1 — 1H candles):
+    1. ADX < 30 → mercado en rango (condición necesaria)
     2. RSI(2) < 10 + precio > EMA50 → BUY (pullback en uptrend)
     3. RSI(2) > 90 + precio < EMA50 → SELL (bounce en downtrend)
-    4. Z-Score confirma extremo estadístico (|Z| > 2.0)
+    4. Z-Score confirma extremo estadístico (|Z| > 1.5σ)
     5. Slippage check antes de ejecutar
     """
     if len(klines) < max(KLINE_LIMIT, EMA_TREND_PERIOD + 10):
@@ -378,6 +379,23 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
         action = "SELL"
     
     if not action:
+        # ── NEAR MISS: log cuando 2/3 condiciones se cumplen ──
+        buy_conds = [rsi < RSI_OVERSOLD, trend == "BULLISH", zscore < -ZSCORE_THRESHOLD]
+        sell_conds = [rsi > RSI_OVERBOUGHT, trend == "BEARISH", zscore > ZSCORE_THRESHOLD]
+        buy_met = sum(buy_conds)
+        sell_met = sum(sell_conds)
+        if buy_met == 2:
+            missing = []
+            if not buy_conds[0]: missing.append(f"RSI={rsi:.1f} > {RSI_OVERSOLD}")
+            if not buy_conds[1]: missing.append(f"Trend={trend} ≠ BULLISH")
+            if not buy_conds[2]: missing.append(f"Z={zscore:+.2f} > -{ZSCORE_THRESHOLD}")
+            logger.info(f"[NEAR MISS] {symbol} BUY 2/3 — falta: {', '.join(missing)}")
+        elif sell_met == 2:
+            missing = []
+            if not sell_conds[0]: missing.append(f"RSI={rsi:.1f} < {RSI_OVERBOUGHT}")
+            if not sell_conds[1]: missing.append(f"Trend={trend} ≠ BEARISH")
+            if not sell_conds[2]: missing.append(f"Z={zscore:+.2f} < +{ZSCORE_THRESHOLD}")
+            logger.info(f"[NEAR MISS] {symbol} SELL 2/3 — falta: {', '.join(missing)}")
         return None
     
     # ── SL basado en ATR ──
@@ -403,9 +421,9 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     else:
         rsi_score = max(0, min(30, (rsi - 90) / 10 * 30))
     
-    # Z-Score score (25pts): |Z|>3 = max, |Z|=2 = min
+    # Z-Score score (25pts): |Z|>3 = max, |Z|=1.5 = min
     z_abs = abs(zscore)
-    z_score_pts = max(0, min(25, (z_abs - 2.0) / 1.5 * 25))
+    z_score_pts = max(0, min(25, (z_abs - 1.5) / 1.5 * 25))
     
     # ADX score (20pts): ADX<15 = max (muy lateral), ADX=25 = 0
     adx_score = max(0, min(20, (25 - adx) / 10 * 20))
@@ -696,18 +714,19 @@ def tg_close_alert(symbol: str, pos: dict, close_price: float, pnl: float, reaso
 
 def tg_startup(balance: float):
     tg_send(
-        f"👻 <b>PHANTOM v1.0 iniciado</b>\n"
+        f"👻 <b>PHANTOM v1.1 iniciado</b>\n"
         f"{'━' * 24}\n"
         f"Estrategia: Mean-Reversion (RSI2 + Z-Score)\n"
+        f"Timeframe: {KLINE_TIMEFRAME} | Eval: {EVAL_INTERVAL//60}min\n"
         f"Activos: {', '.join(CRYPTO_PAIRS)} + {STOCK_SYMBOL}\n"
         f"Balance: ${balance:,.2f}\n"
         f"Riesgo: {RISK_PCT*100:.0f}% por trade | Lev: {LEVERAGE}x\n"
-        f"Régimen: Solo ADX &lt; {ADX_THRESHOLD}\n"
-        f"Eval: cada {EVAL_INTERVAL//60} min\n"
         f"{'━' * 24}\n"
-        f"SL: ATR × {ATR_SL_MULT} | Slippage gate: {MAX_SLIPPAGE_PCT*100:.1f}%\n"
-        f"Entry: RSI2 &lt; {RSI_OVERSOLD} (BUY) / &gt; {RSI_OVERBOUGHT} (SELL)\n"
-        f"Exit: RSI2 &gt; {RSI_EXIT_LONG} (BUY) / &lt; {RSI_EXIT_SHORT} (SELL)"
+        f"RSI2: &lt;{RSI_OVERSOLD} / &gt;{RSI_OVERBOUGHT}\n"
+        f"Z-Score: ±{ZSCORE_THRESHOLD}σ\n"
+        f"ADX: &lt;{ADX_THRESHOLD} (lateral)\n"
+        f"SL: ATR × {ATR_SL_MULT}\n"
+        f"Exit: RSI2 &gt;{RSI_EXIT_LONG} / &lt;{RSI_EXIT_SHORT}"
     )
 
 def tg_daily_report():
@@ -753,11 +772,12 @@ def main_loop():
     
     _start_balance = get_balance()
     logger.info("=" * 60)
-    logger.info("PHANTOM v1.0 — Wino and Company")
+    logger.info("PHANTOM v1.1 — Wino and Company")
     logger.info(f"Balance: ${_start_balance:,.2f}")
     logger.info(f"Activos: {CRYPTO_PAIRS} + {STOCK_SYMBOL}")
     logger.info(f"Estrategia: Mean-Reversion RSI(2) + Z-Score + ADX Regime")
-    logger.info(f"Eval cada {EVAL_INTERVAL//60} min | SL ATR×{ATR_SL_MULT}")
+    logger.info(f"Timeframe: {KLINE_TIMEFRAME} | Eval cada {EVAL_INTERVAL//60} min | SL ATR×{ATR_SL_MULT}")
+    logger.info(f"Thresholds: RSI<{RSI_OVERSOLD}/{RSI_OVERBOUGHT}> | Z>{ZSCORE_THRESHOLD}σ | ADX<{ADX_THRESHOLD}")
     logger.info("=" * 60)
     
     tg_startup(_start_balance)
