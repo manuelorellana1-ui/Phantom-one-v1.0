@@ -649,12 +649,12 @@ def tg_startup(balance: float):
         f"Activos: {', '.join(CRYPTO_PAIRS)} + {STOCK_SYMBOL}\n"
         f"Balance: ${balance:,.2f}\n"
         f"Riesgo: {RISK_PCT*100:.0f}% por trade | Lev: {LEVERAGE}x\n"
-        f"Régimen: Solo ADX < {ADX_THRESHOLD}\n"
+        f"Régimen: Solo ADX &lt; {ADX_THRESHOLD}\n"
         f"Eval: cada {EVAL_INTERVAL//60} min\n"
         f"{'━' * 24}\n"
         f"SL: ATR × {ATR_SL_MULT} | Slippage gate: {MAX_SLIPPAGE_PCT*100:.1f}%\n"
-        f"Entry: RSI2 < {RSI_OVERSOLD} (BUY) / > {RSI_OVERBOUGHT} (SELL)\n"
-        f"Exit: RSI2 > {RSI_EXIT_LONG} (BUY) / < {RSI_EXIT_SHORT} (SELL)"
+        f"Entry: RSI2 &lt; {RSI_OVERSOLD} (BUY) / &gt; {RSI_OVERBOUGHT} (SELL)\n"
+        f"Exit: RSI2 &gt; {RSI_EXIT_LONG} (BUY) / &lt; {RSI_EXIT_SHORT} (SELL)"
     )
 
 def tg_daily_report():
