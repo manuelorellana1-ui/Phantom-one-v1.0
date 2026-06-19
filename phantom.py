@@ -127,11 +127,71 @@ def api_get(path: str, params: dict = None) -> dict:
 def api_post(path: str, params: dict = None) -> dict:
     try:
         p = _sign(params or {})
-        r = requests.post(f"{BINGX_BASE}{path}", json=p, headers=_headers(), timeout=10)
+        r = requests.post(f"{BINGX_BASE}{path}", params=p, headers=_headers(), timeout=10)
         return r.json()
     except Exception as e:
         logger.error(f"[API] POST {path}: {e}")
         return {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRADE SETUP — leverage, margin mode, step size
+# ══════════════════════════════════════════════════════════════════════════════
+
+_step_size_cache: Dict[str, float] = {}
+
+
+def get_step_size(symbol: str) -> float:
+    """Obtiene el tamaño mínimo de cantidad para un símbolo."""
+    if symbol in _step_size_cache:
+        return _step_size_cache[symbol]
+
+    data = api_get("/openApi/swap/v2/quote/contracts", {})
+    if data.get("code") != 0:
+        return 0.001
+
+    contracts = data.get("data", [])
+    if isinstance(contracts, list):
+        for c in contracts:
+            sym = c.get("symbol", "")
+            step = float(c.get("tradeMinQuantity", 0.001))
+            _step_size_cache[sym] = step
+            if sym == symbol:
+                logger.info(f"[STEPSIZE] {symbol} = {step}")
+                return step
+
+    return 0.001
+
+
+def round_qty(symbol: str, qty_raw: float) -> float:
+    """Redondea cantidad al step size válido para BingX."""
+    step = get_step_size(symbol)
+    qty = int(qty_raw / step) * step
+    return round(qty, 8)
+
+
+def set_leverage_all(pairs: list, leverage: int):
+    """Configura leverage y margin mode para todos los pares."""
+    for symbol in pairs:
+        # Margin mode ISOLATED
+        try:
+            api_post("/openApi/swap/v2/trade/marginType",
+                     {"symbol": symbol, "marginType": "ISOLATED"})
+            logger.info(f"[SETUP] {symbol} margin=ISOLATED")
+        except Exception as e:
+            logger.warning(f"[SETUP] {symbol} margin error: {e}")
+
+        # Leverage LONG + SHORT
+        try:
+            api_post("/openApi/swap/v2/trade/leverage",
+                     {"symbol": symbol, "side": "LONG", "leverage": leverage})
+            api_post("/openApi/swap/v2/trade/leverage",
+                     {"symbol": symbol, "side": "SHORT", "leverage": leverage})
+            logger.info(f"[SETUP] {symbol} leverage={leverage}x OK")
+        except Exception as e:
+            logger.warning(f"[SETUP] {symbol} leverage error: {e}")
+
+        time.sleep(0.3)  # rate limit
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -523,8 +583,13 @@ def execute_crypto(signal: dict) -> bool:
         )
         return False
     
-    # ── Calcular cantidad ──
-    qty = notional / real_price
+    # ── Calcular cantidad con step size ──
+    qty_raw = notional / real_price
+    qty = round_qty(symbol, qty_raw)
+    
+    if qty <= 0:
+        logger.error(f"[EXEC] {symbol} qty=0 después de step size (notional=${notional:.2f} price=${real_price:.2f})")
+        return False
     
     # ── Colocar orden ──
     side = "BUY" if action == "BUY" else "SELL"
@@ -533,7 +598,7 @@ def execute_crypto(signal: dict) -> bool:
         "side": side,
         "positionSide": "LONG" if action == "BUY" else "SHORT",
         "type": "MARKET",
-        "quantity": str(round(qty, 6)),
+        "quantity": qty,
     }
     
     result = api_post("/openApi/swap/v2/trade/order", order_params)
@@ -773,6 +838,11 @@ def main_loop():
     logger.info("=" * 60)
     
     tg_startup(_start_balance)
+    
+    # ── Setup leverage y margin mode para todos los pares ──
+    logger.info("[SETUP] Configurando leverage y margin mode...")
+    set_leverage_all(CRYPTO_PAIRS, LEVERAGE)
+    logger.info("[SETUP] ✅ Completado")
     
     last_daily_reset = datetime.now(timezone.utc).date()
     
