@@ -598,7 +598,7 @@ def execute_crypto(signal: dict) -> bool:
         "side": side,
         "positionSide": "LONG" if action == "BUY" else "SHORT",
         "type": "MARKET",
-        "quantity": qty,
+        "quantity": str(qty),
     }
     
     result = api_post("/openApi/swap/v2/trade/order", order_params)
