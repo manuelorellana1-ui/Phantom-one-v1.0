@@ -104,21 +104,27 @@ _start_balance = 0.0
 # BINGX API CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _sign(params: dict) -> dict:
-    """Firma HMAC-SHA256 para BingX API."""
-    params = {k: str(v) for k, v in params.items()}
-    params["timestamp"] = str(int(time.time() * 1000))
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    sig = hmac.new(BINGX_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-    params["signature"] = sig
-    return params
+def _sign(params: dict) -> str:
+    """Firma HMAC-SHA256 — idéntica a WinoBot (NO ordena params)."""
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    return hmac.new(
+        BINGX_API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
 
 def _headers() -> dict:
-    return {"X-BX-APIKEY": BINGX_API_KEY, "Content-Type": "application/json"}
+    return {
+        "X-BX-APIKEY": BINGX_API_KEY,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
 
-def api_get(path: str, params: dict = None) -> dict:
+def api_get(path: str, params: dict = None, signed: bool = True) -> dict:
     try:
-        p = _sign(params or {})
+        p = params or {}
+        if signed:
+            p["timestamp"] = int(time.time() * 1000)
+            p["signature"] = _sign(p)
         r = requests.get(f"{BINGX_BASE}{path}", params=p, headers=_headers(), timeout=10)
         return r.json()
     except Exception as e:
@@ -127,7 +133,9 @@ def api_get(path: str, params: dict = None) -> dict:
 
 def api_post(path: str, params: dict = None) -> dict:
     try:
-        p = _sign(params or {})
+        p = params or {}
+        p["timestamp"] = int(time.time() * 1000)
+        p["signature"] = _sign(p)
         r = requests.post(f"{BINGX_BASE}{path}", params=p, headers=_headers(), timeout=10)
         return r.json()
     except Exception as e:
