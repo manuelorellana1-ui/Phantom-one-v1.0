@@ -106,6 +106,7 @@ _start_balance = 0.0
 
 def _sign(params: dict) -> dict:
     """Firma HMAC-SHA256 para BingX API."""
+    params = {k: str(v) for k, v in params.items()}
     params["timestamp"] = str(int(time.time() * 1000))
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     sig = hmac.new(BINGX_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
