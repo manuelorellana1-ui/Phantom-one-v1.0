@@ -84,7 +84,7 @@ RISK_PCT          = 0.15    # 15% del capital por trade (Kelly óptimo para 75% 
 ATR_SL_MULT       = 3.0    # SL = ATR × 3.0 (fuera del ruido)
 MAX_POSITIONS     = 2       # máximo 2 posiciones simultáneas
 DAILY_LOSS_LIMIT  = 0.03    # -3% del capital = stop trading hoy
-MAX_SLIPPAGE_PCT  = 0.20    # 20% max (v1.2: 1H kline close vs mark price puede diferir hasta ~15%)
+MAX_SLIPPAGE_PCT  = 0.10    # 10% max (v1.2: 1H candles pueden diferir del mark price hasta ~10%)
 
 # ── Evaluación ──
 EVAL_INTERVAL     = 900     # Evaluar cada 15 minutos (captura candle 1H formándose)
@@ -527,28 +527,29 @@ def check_exit(symbol: str, klines: List[dict]) -> Optional[str]:
     """
     Verifica si debemos cerrar una posición abierta.
     
-    Regla de salida (Connors):
-    - LONG: RSI(2) > 60 → el snapback ya ocurrió, tomar ganancias
-    - SHORT: RSI(2) < 40 → el snapback ya ocurrió, tomar ganancias
-    - SL: si el precio cruza el SL, cerrar inmediatamente
+    v1.2 fix: usa mark price REAL para SL, kline RSI para exit signal.
     """
     if symbol not in _positions:
         return None
     
     pos = _positions[symbol]
     closes = [k["close"] for k in klines]
-    price = closes[-1]
     rsi = calc_rsi(closes, RSI_PERIOD)
     
-    # ── Check SL ──
-    if pos["action"] == "BUY" and price <= pos["sl"]:
-        logger.info(f"[EXIT] 🛑 SL HIT {symbol} @ ${price:,.2f} (SL=${pos['sl']:,.2f})")
+    # ── Precio REAL para SL (no kline stale) ──
+    real_price = get_price(symbol)
+    if real_price <= 0:
+        real_price = closes[-1]  # fallback
+    
+    # ── Check SL con precio real ──
+    if pos["action"] == "BUY" and real_price <= pos["sl"]:
+        logger.info(f"[EXIT] 🛑 SL HIT {symbol} @ ${real_price:,.2f} (SL=${pos['sl']:,.2f})")
         return "SL"
-    elif pos["action"] == "SELL" and price >= pos["sl"]:
-        logger.info(f"[EXIT] 🛑 SL HIT {symbol} @ ${price:,.2f} (SL=${pos['sl']:,.2f})")
+    elif pos["action"] == "SELL" and real_price >= pos["sl"]:
+        logger.info(f"[EXIT] 🛑 SL HIT {symbol} @ ${real_price:,.2f} (SL=${pos['sl']:,.2f})")
         return "SL"
     
-    # ── Check RSI exit ──
+    # ── Check RSI exit (usa kline data, correcto) ──
     if pos["action"] == "BUY" and rsi > RSI_EXIT_LONG:
         logger.info(f"[EXIT] ✅ RSI EXIT {symbol} RSI={rsi:.1f} > {RSI_EXIT_LONG} (mean reverted)")
         return "RSI_EXIT"
@@ -729,6 +730,14 @@ def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: s
     side = "LONG" if signal["action"] == "BUY" else "SHORT"
     sl_pct = abs(fill - sl) / fill * 100
     conf = signal.get("confidence", 0)
+    atr = signal.get("atr", 0)
+    
+    # ── TP estimado (ATR × 1.5 desde fill) ──
+    if signal["action"] == "BUY":
+        tp_est = fill + atr * 1.5
+    else:
+        tp_est = fill - atr * 1.5
+    tp_pct = abs(tp_est - fill) / fill * 100
     
     # Score visual bar
     filled = round(conf / 10)
@@ -748,6 +757,7 @@ def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: s
         f"{emoji} <b>PHANTOM — {side} {signal['symbol']}</b>\n"
         f"{'━' * 24}\n"
         f"📍 Entry:   ${fill:,.2f}\n"
+        f"🎯 TP est:  ${tp_est:,.2f} (+{tp_pct:.2f}%)\n"
         f"🛑 SL:      ${sl:,.2f} (-{sl_pct:.2f}%)\n"
         f"📊 Exit:    RSI(2) cruza {'60' if signal['action']=='BUY' else '40'}\n"
         f"{'━' * 24}\n"
