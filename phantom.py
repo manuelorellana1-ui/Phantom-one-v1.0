@@ -84,8 +84,7 @@ RISK_PCT          = 0.15    # 15% del capital por trade (Kelly óptimo para 75% 
 ATR_SL_MULT       = 3.0    # SL = ATR × 3.0 (fuera del ruido)
 MAX_POSITIONS     = 2       # máximo 2 posiciones simultáneas
 DAILY_LOSS_LIMIT  = 0.03    # -3% del capital = stop trading hoy
-MAX_SLIPPAGE_PCT  = 0.10    # 10% max (v1.2: 1H candles pueden diferir del mark price hasta ~10%)
-
+MAX_SLIPPAGE_PCT  = 0.20    # 20% max (v1.2: 1H kline close vs mark price puede diferir hasta ~15%)
 # ── Evaluación ──
 EVAL_INTERVAL     = 900     # Evaluar cada 15 minutos (captura candle 1H formándose)
 KLINE_TIMEFRAME   = "1h"    # Velas de 1 hora (v1.1: era 15m)
