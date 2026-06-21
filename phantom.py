@@ -404,6 +404,12 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
         logger.debug(f"[EVAL] {symbol} — datos insuficientes ({len(klines)} velas)")
         return None
     
+    # ── Inyectar mark price actual como close del candle formándose ──
+    # Sin esto, los indicadores son stale hasta que cierre la vela 1H
+    mark = get_price(symbol)
+    if mark > 0:
+        klines[-1] = {**klines[-1], "close": mark}
+    
     closes = [k["close"] for k in klines]
     price = closes[-1]
     
@@ -532,11 +538,15 @@ def check_exit(symbol: str, klines: List[dict]) -> Optional[str]:
         return None
     
     pos = _positions[symbol]
+    
+    # ── Inyectar mark price actual para RSI fresco ──
+    real_price = get_price(symbol)
+    if real_price > 0:
+        klines[-1] = {**klines[-1], "close": real_price}
+    
     closes = [k["close"] for k in klines]
     rsi = calc_rsi(closes, RSI_PERIOD)
     
-    # ── Precio REAL para SL (no kline stale) ──
-    real_price = get_price(symbol)
     if real_price <= 0:
         real_price = closes[-1]  # fallback
     
