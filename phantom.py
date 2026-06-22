@@ -350,6 +350,17 @@ def get_positions() -> List[dict]:
         return data.get("data", [])
     return []
 
+def position_exists_on_exchange(symbol: str) -> bool:
+    """Verifica si el símbolo tiene posición real abierta en BingX."""
+    try:
+        for pos in get_positions():
+            if pos.get("symbol") == symbol and abs(float(pos.get("positionAmt", 0))) > 0:
+                return True
+    except Exception as e:
+        logger.error(f"[SYNC] Error verificando posición {symbol}: {e}")
+        return True  # en caso de error, asumir que existe (no borrar)
+    return False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICADORES MATEMÁTICOS
@@ -648,10 +659,20 @@ def check_exit(symbol: str, klines: List[dict], mark_price: float = 0) -> Option
         real_price = closes[-1]  # fallback
     
     # ── Check SL con precio real ──
+    sl_hit = False
     if pos["action"] == "BUY" and real_price <= pos["sl"]:
-        logger.info(f"[EXIT] 🛑 SL HIT {symbol} @ ${real_price:,.2f} (SL=${pos['sl']:,.2f})")
-        return "SL"
+        sl_hit = True
     elif pos["action"] == "SELL" and real_price >= pos["sl"]:
+        sl_hit = True
+    
+    if sl_hit:
+        # Verificar si BingX ya cerró por STOP_MARKET server-side
+        if not position_exists_on_exchange(symbol):
+            logger.info(f"[SYNC] {symbol} — posición cerrada por BingX (SL server-side). Limpiando local.")
+            tg_send(f"🔄 <b>SYNC</b> {symbol}\nPosición cerrada por BingX (SL server-side)")
+            del _positions[symbol]
+            db_delete_position(symbol)
+            return None
         logger.info(f"[EXIT] 🛑 SL HIT {symbol} @ ${real_price:,.2f} (SL=${pos['sl']:,.2f})")
         return "SL"
     
@@ -824,6 +845,12 @@ def close_crypto(symbol: str, reason: str) -> float:
         del _positions[symbol]
         db_delete_position(symbol)
         return pnl
+    
+    # ── Si close falla, verificar si BingX ya cerró la posición ──
+    if not position_exists_on_exchange(symbol):
+        logger.warning(f"[SYNC] {symbol} — close falló pero posición no existe en BingX. Limpiando local.")
+        del _positions[symbol]
+        db_delete_position(symbol)
     
     return 0.0
 
