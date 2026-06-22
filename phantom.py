@@ -1,9 +1,24 @@
 """
-phantom.py — Phantom Bot v1.2
+phantom.py — Phantom Bot v1.3
 Wino and Company · Junio 2026
 
 ESTRATEGIA: Statistical Mean-Reversion con Detección de Régimen
 ═════════════════════════════════════════════════════════════════
+
+v1.3 CHANGELOG (21-Jun-2026):
+  - Fix: mark price inyectado en last candle para indicadores live (no stale)
+  - Fix: RSI(2) ahora usa Wilder smoothing real (match TradingView)
+  - Fix: SQLite persistence para posiciones (sobrevive redeploys)
+  - Fix: cancel SL orders huérfanas al cerrar por RSI exit
+  - Fix: min confidence gate (score < 30 = no ejecutar)
+  - Fix: PnL descuenta taker fees (0.05% × 2)
+  - Fix: is_us_market_open usa zoneinfo (EDT/EST correcto todo el año)
+  - Fix: mark price fetch 1 vez por símbolo por ciclo (no 2x)
+  - Fix: get_klines usa signed=False (endpoint público)
+  - Fix: docstring execute_crypto corregido (MARKET, no limit)
+  - Add: NEAR MISS logging (2/3 condiciones cumplidas)
+  - Add: fill_price=0 fallback consulta posición real
+  - Clean: imports no usados removidos (json, deque, Tuple)
 
 v1.2 CHANGELOG (18-Jun-2026):
   - Trend filter: GATE → BIAS (ya no bloquea entradas counter-trend)
@@ -16,7 +31,6 @@ v1.1 CHANGELOG (18-Jun-2026):
   - Z-Score threshold: 2.0σ → 1.5σ (compensa menor volatilidad intra-candle 1H)
   - Kline limit: 100 → 200 (más data para cálculos en 1H)
   - Activos: +ETH-USDT (mayor superficie de señales)
-  - Logging: NEAR MISS cuando 2/3 condiciones se cumplen
 
 LÓGICA CORE:
   1. Régimen: ADX < 40 = mercado lateral/semi-trending → mean-reversion activo
@@ -27,6 +41,7 @@ LÓGICA CORE:
      - With-trend: +15pts confianza
      - Counter-trend: -15pts confianza (penalidad, no bloqueo)
   4. Salida: RSI(2) cruza 60 (BUY) o 40 (SELL) — NO target fijo
+  5. Min confidence: score >= 30 para ejecutar
 
 ACTIVOS: BTC-USDT, SOL-USDT, ETH-USDT (BingX auto) + NVDA (Telegram/Quantfury)
 OBJETIVO: +1-2% diario sobre capital disponible
@@ -36,12 +51,12 @@ import os
 import time
 import hmac
 import hashlib
-import json
+import sqlite3
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List, Tuple
-from collections import deque
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, List
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -85,6 +100,8 @@ ATR_SL_MULT       = 3.0    # SL = ATR × 3.0 (fuera del ruido)
 MAX_POSITIONS     = 2       # máximo 2 posiciones simultáneas
 DAILY_LOSS_LIMIT  = 0.03    # -3% del capital = stop trading hoy
 MAX_SLIPPAGE_PCT  = 0.20    # 20% max (v1.2: 1H kline close vs mark price puede diferir hasta ~15%)
+MIN_CONFIDENCE    = 30      # Score mínimo para ejecutar (v1.3: gate real, no decorativo)
+TAKER_FEE         = 0.0005  # 0.05% taker fee BingX
 # ── Evaluación ──
 EVAL_INTERVAL     = 900     # Evaluar cada 15 minutos (captura candle 1H formándose)
 KLINE_TIMEFRAME   = "1h"    # Velas de 1 hora (v1.1: era 15m)
@@ -93,11 +110,71 @@ KLINE_LIMIT       = 200     # Últimas 200 velas (v1.1: era 100)
 # ── BingX API ──
 BINGX_BASE = "https://open-api.bingx.com"
 
-# ── Estado ──
+# ── SQLite DB ──
+DB_PATH = os.getenv("PHANTOM_DB", "/tmp/phantom_positions.db")
+
+# ── Estado (runtime) ──
 _positions: Dict[str, dict] = {}
 _daily_pnl = 0.0
 _daily_trades = 0
 _start_balance = 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SQLITE PERSISTENCE — posiciones sobreviven redeploys
+# ══════════════════════════════════════════════════════════════════════════════
+
+def init_db():
+    """Crea tabla de posiciones si no existe."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            symbol     TEXT PRIMARY KEY,
+            action     TEXT NOT NULL,
+            entry      REAL NOT NULL,
+            sl         REAL NOT NULL,
+            qty        REAL NOT NULL,
+            margin     REAL NOT NULL,
+            opened_at  TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info(f"[DB] SQLite initialized: {DB_PATH}")
+
+
+def db_save_position(symbol: str, pos: dict):
+    """Guarda posición en SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO positions (symbol, action, entry, sl, qty, margin, opened_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (symbol, pos["action"], pos["entry"], pos["sl"], pos["qty"], pos["margin"], pos["time"])
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_load_positions() -> Dict[str, dict]:
+    """Carga posiciones guardadas al iniciar."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT symbol, action, entry, sl, qty, margin, opened_at FROM positions").fetchall()
+    conn.close()
+    positions = {}
+    for row in rows:
+        positions[row[0]] = {
+            "action": row[1], "entry": row[2], "sl": row[3],
+            "qty": row[4], "margin": row[5], "time": row[6],
+        }
+    return positions
+
+
+def db_delete_position(symbol: str):
+    """Elimina posición de SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
+    conn.commit()
+    conn.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BINGX API CLIENT
@@ -210,7 +287,7 @@ def get_klines(symbol: str, interval: str = KLINE_TIMEFRAME, limit: int = KLINE_
     """Obtiene velas de BingX."""
     data = api_get("/openApi/swap/v3/quote/klines", {
         "symbol": symbol, "interval": interval, "limit": str(limit)
-    })
+    }, signed=False)
     if data.get("code") != 0:
         return []
     raw = data.get("data", [])
@@ -279,15 +356,19 @@ def get_positions() -> List[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def calc_rsi(closes: List[float], period: int = RSI_PERIOD) -> float:
-    """RSI de Wilder con período configurable. Default: RSI(2)."""
+    """RSI de Wilder con smoothing exponencial. Default: RSI(2)."""
     if len(closes) < period + 1:
         return 50.0
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    recent = deltas[-(period):]
-    gains = [d if d > 0 else 0 for d in recent]
-    losses = [-d if d < 0 else 0 for d in recent]
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    gains = [max(d, 0) for d in deltas]
+    losses = [max(-d, 0) for d in deltas]
+    # Seed con SMA
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    # Wilder smoothing (EMA con alpha = 1/period)
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -389,16 +470,16 @@ def calc_adx(klines: List[dict], period: int = ADX_PERIOD) -> float:
 # MOTOR DE SEÑAL — MEAN REVERSION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
+def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional[dict]:
     """
     Evalúa si hay señal de mean-reversion.
     
-    Reglas (v1.2 — trend como bias):
+    Reglas (v1.3):
     1. ADX < 40 → mercado en rango o semi-trending (condición necesaria)
     2. RSI(2) < 10 + Z < -1.5σ → BUY (oversold extremo)
     3. RSI(2) > 90 + Z > +1.5σ → SELL (overbought extremo)
     4. Trend EMA50: ajusta confidence (+15 with-trend, -15 counter-trend)
-    5. Slippage check antes de ejecutar
+    5. Confidence >= MIN_CONFIDENCE para ejecutar
     """
     if len(klines) < max(KLINE_LIMIT, EMA_TREND_PERIOD + 10):
         logger.debug(f"[EVAL] {symbol} — datos insuficientes ({len(klines)} velas)")
@@ -406,9 +487,9 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     
     # ── Inyectar mark price actual como close del candle formándose ──
     # Sin esto, los indicadores son stale hasta que cierre la vela 1H
-    mark = get_price(symbol)
-    if mark > 0:
-        klines[-1] = {**klines[-1], "close": mark}
+    if mark_price > 0:
+        klines = list(klines)  # copia para no mutar original
+        klines[-1] = {**klines[-1], "close": mark_price}
     
     closes = [k["close"] for k in klines]
     price = closes[-1]
@@ -460,6 +541,18 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
         with_trend = True
     
     if not action:
+        # ── NEAR MISS: 2 de 3 condiciones cumplidas ──
+        rsi_ok = rsi < RSI_OVERSOLD or rsi > RSI_OVERBOUGHT
+        z_ok = abs(zscore) > ZSCORE_THRESHOLD
+        adx_ok = adx < ADX_THRESHOLD
+        conditions_met = sum([rsi_ok, z_ok, adx_ok])
+        if conditions_met >= 2:
+            logger.info(
+                f"[NEAR MISS] {symbol} {conditions_met}/3 | "
+                f"RSI={'✅' if rsi_ok else '❌'}{rsi:.1f} "
+                f"Z={'✅' if z_ok else '❌'}{zscore:+.2f} "
+                f"ADX={'✅' if adx_ok else '❌'}{adx:.1f}"
+            )
         return None
     
     # ── SL basado en ATR ──
@@ -504,6 +597,14 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     confidence = round(rsi_score + z_score_pts + adx_score + trend_score + vol_score)
     confidence = max(0, min(100, confidence))
     
+    # ── MIN CONFIDENCE GATE (v1.3: score es un gate real, no decorativo) ──
+    if confidence < MIN_CONFIDENCE:
+        logger.info(
+            f"[EVAL] {symbol} SKIP — Score={confidence} < {MIN_CONFIDENCE} | "
+            f"{action} RSI={rsi:.1f} Z={zscore:+.2f} [{trend_label}-TREND]"
+        )
+        return None
+    
     logger.info(
         f"[SIGNAL] 🎯 {action} {symbol} @ ${price:,.2f} | "
         f"RSI2={rsi:.1f} Z={zscore:+.2f} ADX={adx:.1f} | "
@@ -528,20 +629,20 @@ def evaluate(symbol: str, klines: List[dict]) -> Optional[dict]:
     }
 
 
-def check_exit(symbol: str, klines: List[dict]) -> Optional[str]:
+def check_exit(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional[str]:
     """
     Verifica si debemos cerrar una posición abierta.
-    
-    v1.2 fix: usa mark price REAL para SL, kline RSI para exit signal.
+    v1.3: mark price inyectado desde el loop (1 fetch por símbolo).
     """
     if symbol not in _positions:
         return None
     
     pos = _positions[symbol]
     
-    # ── Inyectar mark price actual para RSI fresco ──
-    real_price = get_price(symbol)
+    # ── Inyectar mark price para RSI fresco ──
+    real_price = mark_price
     if real_price > 0:
+        klines = list(klines)  # copia para no mutar original
         klines[-1] = {**klines[-1], "close": real_price}
     
     closes = [k["close"] for k in klines]
@@ -574,7 +675,7 @@ def check_exit(symbol: str, klines: List[dict]) -> Optional[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def execute_crypto(signal: dict) -> bool:
-    """Ejecuta trade en BingX con limit order."""
+    """Ejecuta trade en BingX con MARKET order."""
     symbol = signal["symbol"]
     action = signal["action"]
     price = signal["price"]
@@ -624,7 +725,14 @@ def execute_crypto(signal: dict) -> bool:
     
     if result.get("code") == 0:
         order_data = result.get("data", {})
-        fill_price = float(order_data.get("price", real_price))
+        fill_price = float(order_data.get("price", 0))
+        
+        # ── fill_price=0 fallback: BingX market orders son asíncronas ──
+        if fill_price <= 0:
+            time.sleep(1)
+            fill_price = get_price(symbol)
+        if fill_price <= 0:
+            fill_price = real_price  # último recurso
         
         # ── Recalcular SL desde fill price ──
         atr = signal["atr"]
@@ -633,7 +741,7 @@ def execute_crypto(signal: dict) -> bool:
         else:
             sl = round(fill_price + atr * ATR_SL_MULT, 6)
         
-        # ── Registrar posición ──
+        # ── Registrar posición (RAM + SQLite) ──
         _positions[symbol] = {
             "action": action,
             "entry": fill_price,
@@ -642,6 +750,7 @@ def execute_crypto(signal: dict) -> bool:
             "margin": margin,
             "time": datetime.now(timezone.utc).isoformat(),
         }
+        db_save_position(symbol, _positions[symbol])
         
         # ── Colocar SL en BingX ──
         sl_side = "SELL" if action == "BUY" else "BUY"
@@ -669,13 +778,20 @@ def execute_crypto(signal: dict) -> bool:
 
 
 def close_crypto(symbol: str, reason: str) -> float:
-    """Cierra posición en BingX."""
+    """Cierra posición en BingX y cancela órdenes huérfanas."""
     if symbol not in _positions:
         return 0.0
     
     pos = _positions[symbol]
     side = "SELL" if pos["action"] == "BUY" else "BUY"
     pos_side = "LONG" if pos["action"] == "BUY" else "SHORT"
+    
+    # ── Cancelar SL orders huérfanas ANTES de cerrar ──
+    try:
+        api_post("/openApi/swap/v2/trade/cancelAllOpenOrders", {"symbol": symbol})
+        logger.info(f"[CLOSE] {symbol} — órdenes pendientes canceladas")
+    except Exception as e:
+        logger.warning(f"[CLOSE] {symbol} — cancel orders error: {e}")
     
     result = api_post("/openApi/swap/v2/trade/order", {
         "symbol": symbol,
@@ -688,15 +804,19 @@ def close_crypto(symbol: str, reason: str) -> float:
     if result.get("code") == 0:
         close_price = get_price(symbol)
         if pos["action"] == "BUY":
-            pnl = (close_price - pos["entry"]) * pos["qty"]
+            raw_pnl = (close_price - pos["entry"]) * pos["qty"]
         else:
-            pnl = (pos["entry"] - close_price) * pos["qty"]
+            raw_pnl = (pos["entry"] - close_price) * pos["qty"]
+        
+        # ── Descontar taker fees (open + close) ──
+        fee = (pos["entry"] * pos["qty"] + close_price * pos["qty"]) * TAKER_FEE
+        pnl = raw_pnl - fee
         
         pnl_pct = pnl / pos["margin"] * 100
         
         logger.info(
             f"[CLOSE] {symbol} {reason} | Entry=${pos['entry']:,.2f} → "
-            f"Close=${close_price:,.2f} | PnL=${pnl:+.2f} ({pnl_pct:+.1f}%)"
+            f"Close=${close_price:,.2f} | PnL=${pnl:+.2f} ({pnl_pct:+.1f}%) fee=${fee:.4f}"
         )
         
         tg_close_alert(symbol, pos, close_price, pnl, reason)
@@ -706,6 +826,7 @@ def close_crypto(symbol: str, reason: str) -> float:
         _daily_trades += 1
         
         del _positions[symbol]
+        db_delete_position(symbol)
         return pnl
     
     return 0.0
@@ -798,7 +919,7 @@ def tg_close_alert(symbol: str, pos: dict, close_price: float, pnl: float, reaso
 
 def tg_startup(balance: float):
     tg_send(
-        f"👻 <b>PHANTOM v1.2 iniciado</b>\n"
+        f"👻 <b>PHANTOM v1.3 iniciado</b>\n"
         f"{'━' * 24}\n"
         f"Estrategia: Mean-Reversion (RSI2 + Z-Score)\n"
         f"Trend: BIAS (no bloquea counter-trend)\n"
@@ -807,11 +928,13 @@ def tg_startup(balance: float):
         f"Balance: ${balance:,.2f}\n"
         f"Riesgo: {RISK_PCT*100:.0f}% por trade | Lev: {LEVERAGE}x\n"
         f"{'━' * 24}\n"
-        f"RSI2: &lt;{RSI_OVERSOLD} / &gt;{RSI_OVERBOUGHT}\n"
+        f"RSI2: &lt;{RSI_OVERSOLD} / &gt;{RSI_OVERBOUGHT} (Wilder)\n"
         f"Z-Score: ±{ZSCORE_THRESHOLD}σ\n"
         f"ADX: &lt;{ADX_THRESHOLD} (lateral)\n"
         f"SL: ATR × {ATR_SL_MULT}\n"
-        f"Exit: RSI2 &gt;{RSI_EXIT_LONG} / &lt;{RSI_EXIT_SHORT}"
+        f"Min Score: {MIN_CONFIDENCE}/100\n"
+        f"Exit: RSI2 &gt;{RSI_EXIT_LONG} / &lt;{RSI_EXIT_SHORT}\n"
+        f"Persistence: SQLite ✅"
     )
 
 def tg_daily_report():
@@ -830,8 +953,8 @@ def tg_daily_report():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_us_market_open() -> bool:
-    """Verifica si el mercado US está abierto."""
-    et = datetime.now(timezone.utc) + timedelta(hours=-4)
+    """Verifica si el mercado US está abierto (EDT/EST automático)."""
+    et = datetime.now(ZoneInfo("America/New_York"))
     if et.weekday() > 4:
         return False
     t = (et.hour, et.minute)
@@ -853,16 +976,25 @@ def evaluate_nvda(klines: List[dict]) -> Optional[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main_loop():
-    global _daily_pnl, _daily_trades, _start_balance
+    global _daily_pnl, _daily_trades, _start_balance, _positions
+    
+    # ── SQLite init + cargar posiciones sobrevivientes ──
+    init_db()
+    _positions = db_load_positions()
+    if _positions:
+        logger.info(f"[DB] Posiciones recuperadas: {list(_positions.keys())}")
+        for sym, pos in _positions.items():
+            logger.info(f"  → {sym} {pos['action']} entry=${pos['entry']:,.2f} sl=${pos['sl']:,.2f} qty={pos['qty']}")
     
     _start_balance = get_balance()
     logger.info("=" * 60)
-    logger.info("PHANTOM v1.2 — Wino and Company")
+    logger.info("PHANTOM v1.3 — Wino and Company")
     logger.info(f"Balance: ${_start_balance:,.2f}")
     logger.info(f"Activos: {CRYPTO_PAIRS} + {STOCK_SYMBOL}")
     logger.info(f"Estrategia: Mean-Reversion RSI(2) + Z-Score + ADX Regime")
     logger.info(f"Timeframe: {KLINE_TIMEFRAME} | Eval cada {EVAL_INTERVAL//60} min | SL ATR×{ATR_SL_MULT}")
     logger.info(f"Thresholds: RSI<{RSI_OVERSOLD}/{RSI_OVERBOUGHT}> | Z>{ZSCORE_THRESHOLD}σ | ADX<{ADX_THRESHOLD}")
+    logger.info(f"Min Confidence: {MIN_CONFIDENCE} | Persistence: SQLite")
     logger.info("=" * 60)
     
     tg_startup(_start_balance)
@@ -902,17 +1034,22 @@ def main_loop():
                 if not klines:
                     continue
                 
+                # ── Un solo fetch de mark price por símbolo ──
+                mark = get_price(symbol)
+                
                 # Check exits primero
-                exit_reason = check_exit(symbol, klines)
+                exit_reason = check_exit(symbol, klines, mark)
                 if exit_reason:
                     close_crypto(symbol, exit_reason)
                     continue
                 
                 # Check entries
                 if len(_positions) < MAX_POSITIONS:
-                    signal = evaluate(symbol, klines)
+                    signal = evaluate(symbol, klines, mark)
                     if signal:
                         execute_crypto(signal)
+                
+                time.sleep(0.3)  # rate limit entre símbolos
             
             # ── Evaluar NVDA (solo durante market hours) ──
             if is_us_market_open():
