@@ -520,7 +520,10 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
         f"[EVAL] {symbol} ${price:,.2f} | "
         f"RSI2={rsi:.1f} Z={zscore:+.2f} ADX={adx:.1f} "
         f"ATR={atr:.4f} EMA50={ema_now:,.2f} | "
-        f"{trend} {regime}"
+        f"{trend} {regime} | "
+        f"RSI={'✅' if rsi < RSI_OVERSOLD or rsi > RSI_OVERBOUGHT else '❌'} "
+        f"Z={'✅' if abs(zscore) > ZSCORE_THRESHOLD else '❌'} "
+        f"ADX={'✅' if adx < ADX_THRESHOLD else '❌'}"
     )
     
     # ── Regla 1: Solo operar en mercado lateral ──
