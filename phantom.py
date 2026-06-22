@@ -7,7 +7,7 @@ ESTRATEGIA: Statistical Mean-Reversion con Detección de Régimen
 
 v1.3 CHANGELOG (21-Jun-2026):
   - Fix: mark price inyectado en last candle para indicadores live (no stale)
-  - Fix: RSI(2) ahora usa Wilder smoothing real (match TradingView)
+  - Fix: RSI(2) docstring corregido — es Cutler's SMA (Pine Script ajustado para match)
   - Fix: SQLite persistence para posiciones (sobrevive redeploys)
   - Fix: cancel SL orders huérfanas al cerrar por RSI exit
   - Fix: min confidence gate (score < 30 = no ejecutar)
@@ -356,19 +356,15 @@ def get_positions() -> List[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def calc_rsi(closes: List[float], period: int = RSI_PERIOD) -> float:
-    """RSI de Wilder con smoothing exponencial. Default: RSI(2)."""
+    """RSI Cutler's (SMA) con período configurable. Default: RSI(2)."""
     if len(closes) < period + 1:
         return 50.0
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [max(d, 0) for d in deltas]
-    losses = [max(-d, 0) for d in deltas]
-    # Seed con SMA
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    # Wilder smoothing (EMA con alpha = 1/period)
-    for i in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    recent = deltas[-(period):]
+    gains = [max(d, 0) for d in recent]
+    losses = [max(-d, 0) for d in recent]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -928,7 +924,7 @@ def tg_startup(balance: float):
         f"Balance: ${balance:,.2f}\n"
         f"Riesgo: {RISK_PCT*100:.0f}% por trade | Lev: {LEVERAGE}x\n"
         f"{'━' * 24}\n"
-        f"RSI2: &lt;{RSI_OVERSOLD} / &gt;{RSI_OVERBOUGHT} (Wilder)\n"
+        f"RSI2: &lt;{RSI_OVERSOLD} / &gt;{RSI_OVERBOUGHT} (Cutler's SMA)\n"
         f"Z-Score: ±{ZSCORE_THRESHOLD}σ\n"
         f"ADX: &lt;{ADX_THRESHOLD} (lateral)\n"
         f"SL: ATR × {ATR_SL_MULT}\n"
