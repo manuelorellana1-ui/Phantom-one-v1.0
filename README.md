@@ -1,2 +1,2 @@
-# Phantom-one-v1.0
+# Phantom-one-v2.0
 Hybrid Trading BOT
