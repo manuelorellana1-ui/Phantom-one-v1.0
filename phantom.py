@@ -1,50 +1,38 @@
 """
-phantom.py — Phantom Bot v1.3
+phantom.py — Phantom Bot v2.0
 Wino and Company · Junio 2026
 
-ESTRATEGIA: Statistical Mean-Reversion con Detección de Régimen
-═════════════════════════════════════════════════════════════════
+ESTRATEGIA: Statistical Mean-Reversion con Confirmación Estructural
+═════════════════════════════════════════════════════════════════════
 
-v1.3 CHANGELOG (21-Jun-2026):
-  - Fix: mark price inyectado en last candle para indicadores live (no stale)
-  - Fix: RSI(2) docstring corregido — es Cutler's SMA (Pine Script ajustado para match)
-  - Fix: SQLite persistence para posiciones (sobrevive redeploys)
-  - Fix: cancel SL orders huérfanas al cerrar por RSI exit
-  - Fix: min confidence gate (score < 30 = no ejecutar)
-  - Fix: PnL descuenta taker fees (0.05% × 2)
-  - Fix: is_us_market_open usa zoneinfo (EDT/EST correcto todo el año)
-  - Fix: mark price fetch 1 vez por símbolo por ciclo (no 2x)
-  - Fix: get_klines usa signed=False (endpoint público)
-  - Fix: docstring execute_crypto corregido (MARKET, no limit)
-  - Add: NEAR MISS logging (2/3 condiciones cumplidas)
-  - Add: fill_price=0 fallback consulta posición real
-  - Clean: imports no usados removidos (json, deque, Tuple)
+v2.0 CHANGELOG (24-Jun-2026) — Full redesign post performance audit:
+  EVIDENCIA: 7/7 trades = counter-trend LONGs en bear market, 0% WR.
+  Sesgo estructural: RSI(2)+Z-Score solo se alinean para BUY en downtrend.
+  Resultado: Phantom era una máquina de catch-the-falling-knife (Judas Swings).
 
-v1.2 CHANGELOG (18-Jun-2026):
-  - Trend filter: GATE → BIAS (ya no bloquea entradas counter-trend)
-  - Counter-trend entries ejecutan con confianza reducida (-15pts)
-  - With-trend entries mantienen bonus completo (+15pts)
-  - Fix: catch-22 donde RSI extremo forzaba price past EMA50
+  CAMBIOS ARQUITECTÓNICOS:
+  - NEW: ALLOW_COUNTER_TREND = False (elimina counter-trend, 7/7 perdedores)
+  - NEW: Two-phase entry system:
+    · Phase 1 (Detection): RSI(2)+Z-Score detectan extensión → ALERT state
+    · Phase 2 (Confirmation): Tenkan cruza Kijun → entrada confirmada
+  - NEW: Kijun-sen gate — no LONG si precio > 3% debajo de Kijun-sen
+  - NEW: Kijun-sen dynamic TP — target en Kijun (equilibrio natural del precio)
+  - NEW: calc_kijun(period=26), calc_tenkan(period=9)
+  - NEW: Alert persistence en SQLite (sobrevive redeploys Railway)
+  - RSI exit conservado como fallback (RSI > 60 LONG / RSI < 40 SHORT)
+  - SL sin cambios: ATR × 3.0
 
-v1.1 CHANGELOG (18-Jun-2026):
-  - Timeframe: 15m → 1H (reduce ruido, EMA50=50h sticky, Z-Score=20h robusto)
-  - Z-Score threshold: 2.0σ → 1.5σ (compensa menor volatilidad intra-candle 1H)
-  - Kline limit: 100 → 200 (más data para cálculos en 1H)
-  - Activos: +ETH-USDT (mayor superficie de señales)
+  FLUJO v2.0:
+  1. evaluate() detecta extensión → guarda ALERT (no ejecuta)
+  2. check_confirmation() verifica TK Cross cada 15 min
+  3. Si TK Cross confirma Y trend sigue with-trend Y Kijun gate pasa → ejecuta
+  4. Alert timeout: 48 horas sin confirmación → alert descartada
+  5. Exit: Kijun TP (primario) → RSI exit (fallback) → SL (protección)
 
-LÓGICA CORE:
-  1. Régimen: ADX < 40 = mercado lateral/semi-trending → mean-reversion activo
-                ADX >= 40 = tendencia fuerte → NO operar (esperar)
-  2. Señal: RSI(2) < 10 + Z-Score < -1.5σ → BUY (oversold extremo)
-           RSI(2) > 90 + Z-Score > +1.5σ → SELL (overbought extremo)
-  3. Trend EMA50: modifica confidence score, NO bloquea entrada
-     - With-trend: +15pts confianza
-     - Counter-trend: -15pts confianza (penalidad, no bloqueo)
-  4. Salida: RSI(2) cruza 60 (BUY) o 40 (SELL) — NO target fijo
-  5. Min confidence: score >= 30 para ejecutar
+  v1.x CHANGELOG preservado en git history.
 
 ACTIVOS: BTC-USDT, SOL-USDT, ETH-USDT (BingX auto) + NVDA (Telegram/Quantfury)
-OBJETIVO: +1-2% diario sobre capital disponible
+OBJETIVO: % de ganancia positiva sobre capital por día (sin WR target)
 """
 
 import os
@@ -93,6 +81,13 @@ EMA_TREND_PERIOD  = 50      # EMA para determinar tendencia
 ADX_PERIOD        = 14      # ADX para detección de régimen
 ADX_THRESHOLD     = 40      # ADX < 40 = lateral + semi-trending (v1.2: era 30)
 
+# ── v2.0: Counter-trend + Ichimoku ──
+ALLOW_COUNTER_TREND    = False   # v2.0: bloqueado (7/7 counter-trend = losses)
+KIJUN_PERIOD           = 26      # Kijun-sen: (HH+LL)/2 de 26 períodos
+TENKAN_PERIOD          = 9       # Tenkan-sen: (HH+LL)/2 de 9 períodos
+KIJUN_GATE_PCT         = 0.03    # No LONG si precio > 3% debajo de Kijun
+ALERT_TIMEOUT_SECONDS  = 48 * 3600  # 48 horas para confirmación TK Cross
+
 # ── Risk Management ──
 LEVERAGE          = 7
 RISK_PCT          = 0.15    # 15% del capital por trade (Kelly óptimo para 75% WR)
@@ -115,6 +110,7 @@ DB_PATH = os.getenv("PHANTOM_DB", "/tmp/phantom_positions.db")
 
 # ── Estado (runtime) ──
 _positions: Dict[str, dict] = {}
+_alerts: Dict[str, dict] = {}  # v2.0: Phase 1 alerts awaiting TK Cross confirmation
 _daily_pnl = 0.0
 _daily_trades = 0
 _start_balance = 0.0
@@ -136,6 +132,15 @@ def init_db():
             qty        REAL NOT NULL,
             margin     REAL NOT NULL,
             opened_at  TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            symbol     TEXT PRIMARY KEY,
+            action     TEXT NOT NULL,
+            price      REAL NOT NULL,
+            confidence INTEGER NOT NULL,
+            created_at TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -173,6 +178,48 @@ def db_delete_position(symbol: str):
     """Elimina posición de SQLite."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
+    conn.commit()
+    conn.close()
+
+
+# ── v2.0: Alert persistence ──
+
+def db_save_alert(symbol: str, alert: dict):
+    """Guarda alert Phase 1 en SQLite (sobrevive redeploys)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO alerts (symbol, action, price, confidence, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (symbol, alert["action"], alert["price"], alert["confidence"],
+         alert["created_at"])
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_load_alerts() -> Dict[str, dict]:
+    """Carga alerts pendientes al iniciar."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT symbol, action, price, confidence, created_at FROM alerts"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    alerts = {}
+    for row in rows:
+        alerts[row[0]] = {
+            "action": row[1], "price": row[2], "confidence": row[3],
+            "created_at": row[4],
+        }
+    return alerts
+
+
+def db_delete_alert(symbol: str):
+    """Elimina alert de SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM alerts WHERE symbol = ?", (symbol,))
     conn.commit()
     conn.close()
 
@@ -473,29 +520,61 @@ def calc_adx(klines: List[dict], period: int = ADX_PERIOD) -> float:
     return adx
 
 
+# ── v2.0: Ichimoku Components ──
+
+def calc_kijun(klines: List[dict], period: int = KIJUN_PERIOD) -> float:
+    """
+    Kijun-sen (Base Line): midpoint of highest high + lowest low over period.
+    Representa el equilibrio natural del precio. Mean-reversion target.
+    Math: (max(high[n]) + min(low[n])) / 2, n = period
+    """
+    if len(klines) < period:
+        return 0.0
+    recent = klines[-period:]
+    hh = max(k["high"] for k in recent)
+    ll = min(k["low"] for k in recent)
+    return (hh + ll) / 2
+
+
+def calc_tenkan(klines: List[dict], period: int = TENKAN_PERIOD) -> float:
+    """
+    Tenkan-sen (Conversion Line): midpoint over 9 periods.
+    Reacciona más rápido que Kijun. TK Cross = señal de momentum.
+    Math: (max(high[n]) + min(low[n])) / 2, n = period
+    """
+    if len(klines) < period:
+        return 0.0
+    recent = klines[-period:]
+    hh = max(k["high"] for k in recent)
+    ll = min(k["low"] for k in recent)
+    return (hh + ll) / 2
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# MOTOR DE SEÑAL — MEAN REVERSION
+# MOTOR DE SEÑAL — MEAN REVERSION v2.0
 # ══════════════════════════════════════════════════════════════════════════════
 
 def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional[dict]:
     """
-    Evalúa si hay señal de mean-reversion.
+    v2.0 Phase 1: Detecta extensión y genera ALERT (NO ejecuta directamente).
     
-    Reglas (v1.3):
-    1. ADX < 40 → mercado en rango o semi-trending (condición necesaria)
-    2. RSI(2) < 10 + Z < -1.5σ → BUY (oversold extremo)
-    3. RSI(2) > 90 + Z > +1.5σ → SELL (overbought extremo)
-    4. Trend EMA50: ajusta confidence (+15 with-trend, -15 counter-trend)
-    5. Confidence >= MIN_CONFIDENCE para ejecutar
+    Reglas:
+    1. ADX < 40 → mercado en rango o semi-trending
+    2. RSI(2) < 10 + Z < -1.5σ → BUY alert
+       RSI(2) > 90 + Z > +1.5σ → SELL alert
+    3. ALLOW_COUNTER_TREND = False → solo with-trend
+    4. Kijun gate: no LONG si precio > 3% debajo de Kijun-sen
+    5. Min confidence >= 30
+    
+    Returns: alert dict para guardar en _alerts, o None
     """
     if len(klines) < max(KLINE_LIMIT, EMA_TREND_PERIOD + 10):
         logger.debug(f"[EVAL] {symbol} — datos insuficientes ({len(klines)} velas)")
         return None
     
     # ── Inyectar mark price actual como close del candle formándose ──
-    # Sin esto, los indicadores son stale hasta que cierre la vela 1H
     if mark_price > 0:
-        klines = list(klines)  # copia para no mutar original
+        klines = list(klines)
         klines[-1] = {**klines[-1], "close": mark_price}
     
     closes = [k["close"] for k in klines]
@@ -507,6 +586,8 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
     adx = calc_adx(klines, ADX_PERIOD)
     atr = calc_atr(klines, 14)
     ema50 = calc_ema(closes, EMA_TREND_PERIOD)
+    kijun = calc_kijun(klines)
+    tenkan = calc_tenkan(klines)
     
     if not ema50:
         return None
@@ -515,11 +596,12 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
     trend = "BULLISH" if price > ema_now else "BEARISH"
     regime = "LATERAL" if adx < ADX_THRESHOLD else "TRENDING"
     
-    # ── Log estado ──
+    # ── Log estado (v2.0: incluye Kijun/Tenkan) ──
     logger.info(
         f"[EVAL] {symbol} ${price:,.2f} | "
         f"RSI2={rsi:.1f} Z={zscore:+.2f} ADX={adx:.1f} "
         f"ATR={atr:.4f} EMA50={ema_now:,.2f} | "
+        f"Kijun={kijun:,.2f} Tenkan={tenkan:,.2f} | "
         f"{trend} {regime} | "
         f"RSI={'✅' if rsi < RSI_OVERSOLD or rsi > RSI_OVERBOUGHT else '❌'} "
         f"Z={'✅' if abs(zscore) > ZSCORE_THRESHOLD else '❌'} "
@@ -528,30 +610,21 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
     
     # ── Regla 1: Solo operar en mercado lateral ──
     if regime == "TRENDING":
-        logger.debug(f"[EVAL] {symbol} SKIP — ADX={adx:.1f} > {ADX_THRESHOLD} (trending)")
         return None
     
-    # ── Verificar si ya tenemos posición en este par ──
-    if symbol in _positions:
+    # ── Verificar si ya tenemos posición o alert en este par ──
+    if symbol in _positions or symbol in _alerts:
         return None
     
-    # ── Regla 2: Señal de entrada (v1.2: trend = bias, no gate) ──
+    # ── Regla 2: Señal de entrada ──
     action = None
-    
     if rsi < RSI_OVERSOLD and zscore < -ZSCORE_THRESHOLD:
         action = "BUY"
     elif rsi > RSI_OVERBOUGHT and zscore > ZSCORE_THRESHOLD:
         action = "SELL"
     
-    # Determinar si es with-trend o counter-trend
-    with_trend = False
-    if action == "BUY" and trend == "BULLISH":
-        with_trend = True
-    elif action == "SELL" and trend == "BEARISH":
-        with_trend = True
-    
     if not action:
-        # ── NEAR MISS: 2 de 3 condiciones cumplidas ──
+        # ── NEAR MISS logging ──
         rsi_ok = rsi < RSI_OVERSOLD or rsi > RSI_OVERBOUGHT
         z_ok = abs(zscore) > ZSCORE_THRESHOLD
         adx_ok = adx < ADX_THRESHOLD
@@ -565,62 +638,221 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
             )
         return None
     
-    # ── SL basado en ATR ──
-    sl_distance = atr * ATR_SL_MULT
-    if action == "BUY":
-        sl = round(price - sl_distance, 6)
-    else:
-        sl = round(price + sl_distance, 6)
+    # ── v2.0: Counter-trend filter (HARD BLOCK) ──
+    with_trend = (action == "BUY" and trend == "BULLISH") or \
+                 (action == "SELL" and trend == "BEARISH")
     
-    sl_pct = sl_distance / price * 100
+    if not ALLOW_COUNTER_TREND and not with_trend:
+        logger.info(
+            f"[EVAL] {symbol} BLOCKED — {action} is COUNTER-TREND "
+            f"({trend}) | RSI={rsi:.1f} Z={zscore:+.2f}"
+        )
+        return None
     
-    # ── CONFIDENCE SCORE (0-100) ──
-    # Factores ponderados:
-    #   RSI extremo (30pts): más extremo = más confianza
-    #   Z-Score profundidad (25pts): más desviaciones = más confianza
-    #   ADX bajo (20pts): más lateral = mejor para mean-reversion
-    #   Trend alignment (15pts): precio bien apoyado en EMA
-    #   Volatilidad estable (10pts): ATR no inflado
+    # ── v2.0: Kijun gate ──
+    if kijun > 0:
+        if action == "BUY":
+            kijun_dist = (kijun - price) / kijun
+            if kijun_dist > KIJUN_GATE_PCT:
+                logger.info(
+                    f"[EVAL] {symbol} BLOCKED — KIJUN GATE | "
+                    f"Price ${price:,.2f} is {kijun_dist:.1%} below Kijun ${kijun:,.2f} "
+                    f"(max {KIJUN_GATE_PCT:.0%})"
+                )
+                return None
+        elif action == "SELL":
+            kijun_dist = (price - kijun) / kijun
+            if kijun_dist > KIJUN_GATE_PCT:
+                logger.info(
+                    f"[EVAL] {symbol} BLOCKED — KIJUN GATE | "
+                    f"Price ${price:,.2f} is {kijun_dist:.1%} above Kijun ${kijun:,.2f} "
+                    f"(max {KIJUN_GATE_PCT:.0%})"
+                )
+                return None
     
-    # RSI score (30pts): RSI<5 o >95 = max, RSI=10/90 = min
+    # ── Confidence score ──
     if action == "BUY":
         rsi_score = max(0, min(30, (10 - rsi) / 10 * 30))
     else:
         rsi_score = max(0, min(30, (rsi - 90) / 10 * 30))
-    
-    # Z-Score score (25pts): |Z|>3 = max, |Z|=1.5 = min
-    z_abs = abs(zscore)
-    z_score_pts = max(0, min(25, (z_abs - 1.5) / 1.5 * 25))
-    
-    # ADX score (20pts): ADX<15 = max (muy lateral), ADX=25 = 0
+    z_score_pts = max(0, min(25, (abs(zscore) - 1.5) / 1.5 * 25))
     adx_score = max(0, min(20, (25 - adx) / 10 * 20))
-    
-    # Trend alignment (15pts): v1.2 BIAS — with-trend = +15, counter-trend = -15
-    trend_score = 15 if with_trend else -15
-    trend_label = "WITH" if with_trend else "COUNTER"
-    
-    # Volatilidad (10pts): ATR estable = bueno (comparar últimas 5 vs 14)
+    trend_score = 15  # v2.0: siempre with-trend (counter-trend bloqueado arriba)
     recent_atr = calc_atr(klines, 5)
     atr_ratio = recent_atr / atr if atr > 0 else 1
     vol_score = max(0, min(10, (2 - abs(atr_ratio - 1) * 5) * 5))
     
-    confidence = round(rsi_score + z_score_pts + adx_score + trend_score + vol_score)
-    confidence = max(0, min(100, confidence))
+    confidence = round(max(0, min(100, rsi_score + z_score_pts + adx_score + trend_score + vol_score)))
     
-    # ── MIN CONFIDENCE GATE (v1.3: score es un gate real, no decorativo) ──
     if confidence < MIN_CONFIDENCE:
         logger.info(
             f"[EVAL] {symbol} SKIP — Score={confidence} < {MIN_CONFIDENCE} | "
-            f"{action} RSI={rsi:.1f} Z={zscore:+.2f} [{trend_label}-TREND]"
+            f"{action} RSI={rsi:.1f} Z={zscore:+.2f}"
         )
         return None
     
+    # ── v2.0: Genera ALERT (no ejecuta) ──
+    now_iso = datetime.now(timezone.utc).isoformat()
+    
+    logger.info(
+        f"[ALERT] 🔔 Phase 1 — {action} {symbol} @ ${price:,.2f} | "
+        f"RSI2={rsi:.1f} Z={zscore:+.2f} ADX={adx:.1f} | "
+        f"Kijun=${kijun:,.2f} Tenkan=${tenkan:,.2f} | "
+        f"{trend} {regime} [WITH-TREND] | "
+        f"Score={confidence}/100 | Awaiting TK Cross confirmation..."
+    )
+    
+    return {
+        "action": action,
+        "symbol": symbol,
+        "price": price,
+        "confidence": confidence,
+        "trend": trend,
+        "regime": regime,
+        "rsi": rsi,
+        "zscore": zscore,
+        "adx": adx,
+        "created_at": now_iso,
+    }
+
+
+def check_confirmation(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional[dict]:
+    """
+    v2.0 Phase 2: Verifica si TK Cross confirma la alerta pendiente.
+    
+    Confirmación = Tenkan cruza Kijun en la dirección del trade:
+      - BUY alert: Tenkan cruza ARRIBA de Kijun (momentum alcista)
+      - SELL alert: Tenkan cruza ABAJO de Kijun (momentum bajista)
+    
+    Validaciones adicionales en confirmación:
+      1. Re-check trend (puede haber flipiado desde la alerta)
+      2. Re-check Kijun gate (Kijun se mueve)
+      3. Timeout: 48 horas desde la alerta
+    
+    Returns: signal dict listo para execute_crypto(), o None
+    """
+    global _alerts
+    
+    alert = _alerts.get(symbol)
+    if not alert:
+        return None
+    
+    # ── Timeout check ──
+    created = datetime.fromisoformat(alert["created_at"])
+    elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+    if elapsed > ALERT_TIMEOUT_SECONDS:
+        logger.info(
+            f"[ALERT] ⏰ TIMEOUT {symbol} — {alert['action']} alert expired "
+            f"after {elapsed/3600:.1f}h (limit {ALERT_TIMEOUT_SECONDS/3600:.0f}h)"
+        )
+        del _alerts[symbol]
+        db_delete_alert(symbol)
+        return None
+    
+    # ── Inyectar mark price ──
+    if mark_price > 0:
+        klines = list(klines)
+        klines[-1] = {**klines[-1], "close": mark_price}
+    
+    closes = [k["close"] for k in klines]
+    price = closes[-1]
+    
+    # ── Calcular Tenkan y Kijun actuales ──
+    tenkan = calc_tenkan(klines)
+    kijun = calc_kijun(klines)
+    
+    if tenkan <= 0 or kijun <= 0:
+        return None
+    
+    # ── Calcular Tenkan y Kijun del bar anterior ──
+    prev_klines = klines[:-1]
+    if len(prev_klines) < KIJUN_PERIOD:
+        return None
+    prev_tenkan = calc_tenkan(prev_klines)
+    prev_kijun = calc_kijun(prev_klines)
+    
+    if prev_tenkan <= 0 or prev_kijun <= 0:
+        return None
+    
+    # ── TK Cross detection ──
+    action = alert["action"]
+    confirmed = False
+    
+    if action == "BUY" and prev_tenkan <= prev_kijun and tenkan > kijun:
+        confirmed = True
+        logger.info(
+            f"[CONFIRM] ✅ TK Cross BULLISH {symbol} | "
+            f"Tenkan={tenkan:,.2f} crossed above Kijun={kijun:,.2f}"
+        )
+    elif action == "SELL" and prev_tenkan >= prev_kijun and tenkan < kijun:
+        confirmed = True
+        logger.info(
+            f"[CONFIRM] ✅ TK Cross BEARISH {symbol} | "
+            f"Tenkan={tenkan:,.2f} crossed below Kijun={kijun:,.2f}"
+        )
+    
+    if not confirmed:
+        return None
+    
+    # ── Re-check trend at confirmation time ──
+    ema_vals = calc_ema(closes, EMA_TREND_PERIOD)
+    if not ema_vals:
+        return None
+    
+    ema_now = ema_vals[-1]
+    trend = "BULLISH" if price > ema_now else "BEARISH"
+    with_trend = (action == "BUY" and trend == "BULLISH") or \
+                 (action == "SELL" and trend == "BEARISH")
+    
+    if not with_trend:
+        logger.info(
+            f"[CONFIRM] ❌ ABORT {symbol} — Trend flipped to {trend} "
+            f"since alert. {action} is now counter-trend."
+        )
+        del _alerts[symbol]
+        db_delete_alert(symbol)
+        return None
+    
+    # ── Re-check Kijun gate at confirmation time ──
+    if action == "BUY" and kijun > 0:
+        kijun_dist = (kijun - price) / kijun
+        if kijun_dist > KIJUN_GATE_PCT:
+            logger.info(
+                f"[CONFIRM] ❌ ABORT {symbol} — KIJUN GATE failed at confirmation | "
+                f"Price ${price:,.2f} is {kijun_dist:.1%} below Kijun ${kijun:,.2f}"
+            )
+            del _alerts[symbol]
+            db_delete_alert(symbol)
+            return None
+    elif action == "SELL" and kijun > 0:
+        kijun_dist = (price - kijun) / kijun
+        if kijun_dist > KIJUN_GATE_PCT:
+            logger.info(
+                f"[CONFIRM] ❌ ABORT {symbol} — KIJUN GATE failed at confirmation | "
+                f"Price ${price:,.2f} is {kijun_dist:.1%} above Kijun ${kijun:,.2f}"
+            )
+            del _alerts[symbol]
+            db_delete_alert(symbol)
+            return None
+    
+    # ── Build execution signal ──
+    atr = calc_atr(klines)
+    adx = calc_adx(klines)
+    sl_distance = atr * ATR_SL_MULT
+    sl = round(price - sl_distance, 6) if action == "BUY" else round(price + sl_distance, 6)
+    sl_pct = sl_distance / price * 100
+    regime = "LATERAL" if adx < ADX_THRESHOLD else "TRENDING"
+    
     logger.info(
         f"[SIGNAL] 🎯 {action} {symbol} @ ${price:,.2f} | "
-        f"RSI2={rsi:.1f} Z={zscore:+.2f} ADX={adx:.1f} | "
-        f"SL=${sl:,.2f} ({sl_pct:.2f}%) | {trend} {regime} [{trend_label}-TREND] | "
-        f"Score={confidence}/100 [RSI={rsi_score:.0f} Z={z_score_pts:.0f} ADX={adx_score:.0f} T={trend_score:.0f} V={vol_score:.0f}]"
+        f"TK Cross confirmed | Kijun TP=${kijun:,.2f} | "
+        f"SL=${sl:,.2f} ({sl_pct:.2f}%) | {trend} {regime} [WITH-TREND] | "
+        f"Score={alert['confidence']}/100"
     )
+    
+    # Cleanup alert
+    del _alerts[symbol]
+    db_delete_alert(symbol)
     
     return {
         "action": action,
@@ -628,21 +860,22 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
         "price": price,
         "sl": sl,
         "sl_pct": sl_pct,
-        "rsi": rsi,
-        "zscore": zscore,
+        "rsi": calc_rsi(closes),
+        "zscore": calc_zscore(closes),
         "adx": adx,
         "atr": atr,
         "trend": trend,
-        "trend_label": trend_label,
+        "trend_label": "WITH",
         "regime": regime,
-        "confidence": confidence,
+        "confidence": alert["confidence"],
+        "kijun_tp": kijun,
     }
 
 
 def check_exit(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional[str]:
     """
     Verifica si debemos cerrar una posición abierta.
-    v1.3: mark price inyectado desde el loop (1 fetch por símbolo).
+    v2.0: Kijun TP (primario) → RSI exit (fallback) → SL (protección).
     """
     if symbol not in _positions:
         return None
@@ -679,7 +912,25 @@ def check_exit(symbol: str, klines: List[dict], mark_price: float = 0) -> Option
         logger.info(f"[EXIT] 🛑 SL HIT {symbol} @ ${real_price:,.2f} (SL=${pos['sl']:,.2f})")
         return "SL"
     
-    # ── Check RSI exit (usa kline data, correcto) ──
+    # ── v2.0: Check Kijun TP (primary exit — dynamic target) ──
+    kijun = calc_kijun(klines)
+    if kijun > 0:
+        if pos["action"] == "BUY" and real_price >= kijun and kijun > pos["entry"]:
+            logger.info(
+                f"[EXIT] 🎯 KIJUN TP {symbol} @ ${real_price:,.2f} | "
+                f"Kijun=${kijun:,.2f} | Entry=${pos['entry']:,.2f} | "
+                f"PnL={(real_price - pos['entry'])/pos['entry']*100:+.2f}%"
+            )
+            return "KIJUN_TP"
+        elif pos["action"] == "SELL" and real_price <= kijun and kijun < pos["entry"]:
+            logger.info(
+                f"[EXIT] 🎯 KIJUN TP {symbol} @ ${real_price:,.2f} | "
+                f"Kijun=${kijun:,.2f} | Entry=${pos['entry']:,.2f} | "
+                f"PnL={(pos['entry'] - real_price)/pos['entry']*100:+.2f}%"
+            )
+            return "KIJUN_TP"
+    
+    # ── Check RSI exit (fallback — v2.0: secondary to Kijun TP) ──
     if pos["action"] == "BUY" and rsi > RSI_EXIT_LONG:
         logger.info(f"[EXIT] ✅ RSI EXIT {symbol} RSI={rsi:.1f} > {RSI_EXIT_LONG} (mean reverted)")
         return "RSI_EXIT"
@@ -915,7 +1166,7 @@ def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: s
         f"📍 Entry:   ${fill:,.2f}\n"
         f"🎯 TP est:  ${tp_est:,.2f} (+{tp_pct:.2f}%)\n"
         f"🛑 SL:      ${sl:,.2f} (-{sl_pct:.2f}%)\n"
-        f"📊 Exit:    RSI(2) cruza {'60' if signal['action']=='BUY' else '40'}\n"
+        f"📊 Exit:    Kijun TP → RSI(2) {'60' if signal['action']=='BUY' else '40'} → SL\n"
         f"{'━' * 24}\n"
         f"📈 RSI(2):  {signal['rsi']:.1f}\n"
         f"📐 Z-Score: {signal['zscore']:+.2f}σ\n"
@@ -945,7 +1196,7 @@ def tg_close_alert(symbol: str, pos: dict, close_price: float, pnl: float, reaso
 
 def tg_startup(balance: float):
     tg_send(
-        f"👻 <b>PHANTOM v1.3 iniciado</b>\n"
+        f"👻 <b>PHANTOM v2.0 iniciado</b>\n"
         f"{'━' * 24}\n"
         f"Estrategia: Mean-Reversion (RSI2 + Z-Score)\n"
         f"Trend: BIAS (no bloquea counter-trend)\n"
@@ -1002,24 +1253,33 @@ def evaluate_nvda(klines: List[dict]) -> Optional[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main_loop():
-    global _daily_pnl, _daily_trades, _start_balance, _positions
+    global _daily_pnl, _daily_trades, _start_balance, _positions, _alerts
     
-    # ── SQLite init + cargar posiciones sobrevivientes ──
+    # ── SQLite init + cargar estado sobreviviente ──
     init_db()
     _positions = db_load_positions()
+    _alerts = db_load_alerts()
+    
     if _positions:
         logger.info(f"[DB] Posiciones recuperadas: {list(_positions.keys())}")
         for sym, pos in _positions.items():
             logger.info(f"  → {sym} {pos['action']} entry=${pos['entry']:,.2f} sl=${pos['sl']:,.2f} qty={pos['qty']}")
+    if _alerts:
+        logger.info(f"[DB] Alerts recuperadas: {list(_alerts.keys())}")
+        for sym, alt in _alerts.items():
+            logger.info(f"  → {sym} {alt['action']} detected @ ${alt['price']:,.2f} | awaiting TK Cross")
     
     _start_balance = get_balance()
     logger.info("=" * 60)
-    logger.info("PHANTOM v1.3 — Wino and Company")
+    logger.info("PHANTOM v2.0 — Wino and Company")
     logger.info(f"Balance: ${_start_balance:,.2f}")
     logger.info(f"Activos: {CRYPTO_PAIRS} + {STOCK_SYMBOL}")
-    logger.info(f"Estrategia: Mean-Reversion RSI(2) + Z-Score + ADX Regime")
+    logger.info(f"Estrategia: Mean-Reversion + TK Cross Confirmation")
     logger.info(f"Timeframe: {KLINE_TIMEFRAME} | Eval cada {EVAL_INTERVAL//60} min | SL ATR×{ATR_SL_MULT}")
     logger.info(f"Thresholds: RSI<{RSI_OVERSOLD}/{RSI_OVERBOUGHT}> | Z>{ZSCORE_THRESHOLD}σ | ADX<{ADX_THRESHOLD}")
+    logger.info(f"Counter-trend: {'ALLOWED' if ALLOW_COUNTER_TREND else 'BLOCKED'}")
+    logger.info(f"Kijun gate: {KIJUN_GATE_PCT:.0%} max distance | TK Cross timeout: {ALERT_TIMEOUT_SECONDS//3600}h")
+    logger.info(f"Exit priority: Kijun TP → RSI exit → SL")
     logger.info(f"Min Confidence: {MIN_CONFIDENCE} | Persistence: SQLite")
     logger.info("=" * 60)
     
@@ -1063,17 +1323,33 @@ def main_loop():
                 # ── Un solo fetch de mark price por símbolo ──
                 mark = get_price(symbol)
                 
-                # Check exits primero
+                # ── 1. Check exits primero ──
                 exit_reason = check_exit(symbol, klines, mark)
                 if exit_reason:
                     close_crypto(symbol, exit_reason)
                     continue
                 
-                # Check entries
-                if len(_positions) < MAX_POSITIONS:
-                    signal = evaluate(symbol, klines, mark)
-                    if signal:
-                        execute_crypto(signal)
+                # ── 2. Check confirmation of pending alerts (Phase 2) ──
+                if symbol in _alerts and len(_positions) < MAX_POSITIONS:
+                    confirmed_signal = check_confirmation(symbol, klines, mark)
+                    if confirmed_signal:
+                        execute_crypto(confirmed_signal)
+                        continue
+                
+                # ── 3. Check for new detections (Phase 1) ──
+                if symbol not in _positions and symbol not in _alerts:
+                    if len(_positions) < MAX_POSITIONS:
+                        alert = evaluate(symbol, klines, mark)
+                        if alert:
+                            _alerts[symbol] = alert
+                            db_save_alert(symbol, alert)
+                            tg_send(
+                                f"🔔 <b>ALERT Phase 1</b>\n"
+                                f"{alert['action']} {symbol} @ ${alert['price']:,.2f}\n"
+                                f"RSI={alert['rsi']:.1f} Z={alert['zscore']:+.2f}\n"
+                                f"Score={alert['confidence']}/100\n"
+                                f"⏳ Awaiting TK Cross confirmation..."
+                            )
                 
                 time.sleep(0.3)  # rate limit entre símbolos
             
