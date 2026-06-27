@@ -1,9 +1,22 @@
 """
-phantom.py — Phantom Bot v2.0
+phantom.py — Phantom Bot v2.1
 Wino and Company · Junio 2026
 
 ESTRATEGIA: Statistical Mean-Reversion con Confirmación Estructural
 ═════════════════════════════════════════════════════════════════════
+
+v2.1 CHANGELOG (27-Jun-2026) — Phase 2 enablement:
+  EVIDENCIA: v2.0 ALLOW_COUNTER_TREND=False bloqueó 100% de señales
+  (mean-reversion genera señales counter-trend por definición).
+  0 trades ejecutados durante freeze period.
+
+  CAMBIOS:
+  - Counter-trend hard block ELIMINADO de Phase 1 y Phase 2
+  - TK Cross en Phase 2 actúa como filtro natural: si Tenkan cruza Kijun
+    en dirección del trade, la reversión ya comenzó → señal válida
+  - Counter-trend penalizado en confidence (-10 pts) pero no bloqueado
+  - Kijun gate preservado (protección contra catching falling knives)
+  - Todos los demás parámetros sin cambios (freeze activo)
 
 v2.0 CHANGELOG (24-Jun-2026) — Full redesign post performance audit:
   EVIDENCIA: 7/7 trades = counter-trend LONGs en bear market, 0% WR.
@@ -638,16 +651,16 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
             )
         return None
     
-    # ── v2.0: Counter-trend filter (HARD BLOCK) ──
+    # ── v2.1: Counter-trend = allowed (TK Cross in Phase 2 is the filter) ──
     with_trend = (action == "BUY" and trend == "BULLISH") or \
                  (action == "SELL" and trend == "BEARISH")
+    trend_label = "WITH-TREND" if with_trend else "COUNTER-TREND"
     
-    if not ALLOW_COUNTER_TREND and not with_trend:
+    if not with_trend:
         logger.info(
-            f"[EVAL] {symbol} BLOCKED — {action} is COUNTER-TREND "
-            f"({trend}) | RSI={rsi:.1f} Z={zscore:+.2f}"
+            f"[EVAL] {symbol} ⚠️ {action} is COUNTER-TREND ({trend}) — "
+            f"allowed, TK Cross must confirm reversal in Phase 2"
         )
-        return None
     
     # ── v2.0: Kijun gate ──
     if kijun > 0:
@@ -677,7 +690,7 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
         rsi_score = max(0, min(30, (rsi - 90) / 10 * 30))
     z_score_pts = max(0, min(25, (abs(zscore) - 1.5) / 1.5 * 25))
     adx_score = max(0, min(20, (25 - adx) / 10 * 20))
-    trend_score = 15  # v2.0: siempre with-trend (counter-trend bloqueado arriba)
+    trend_score = 15 if with_trend else 5  # v2.1: counter-trend penalizado pero permitido
     recent_atr = calc_atr(klines, 5)
     atr_ratio = recent_atr / atr if atr > 0 else 1
     vol_score = max(0, min(10, (2 - abs(atr_ratio - 1) * 5) * 5))
@@ -698,7 +711,7 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
         f"[ALERT] 🔔 Phase 1 — {action} {symbol} @ ${price:,.2f} | "
         f"RSI2={rsi:.1f} Z={zscore:+.2f} ADX={adx:.1f} | "
         f"Kijun=${kijun:,.2f} Tenkan=${tenkan:,.2f} | "
-        f"{trend} {regime} [WITH-TREND] | "
+        f"{trend} {regime} [{trend_label}] | "
         f"Score={confidence}/100 | Awaiting TK Cross confirmation..."
     )
     
@@ -804,14 +817,12 @@ def check_confirmation(symbol: str, klines: List[dict], mark_price: float = 0) -
     with_trend = (action == "BUY" and trend == "BULLISH") or \
                  (action == "SELL" and trend == "BEARISH")
     
+    # ── v2.1: Log trend status but allow counter-trend (TK Cross IS the confirmation) ──
     if not with_trend:
         logger.info(
-            f"[CONFIRM] ❌ ABORT {symbol} — Trend flipped to {trend} "
-            f"since alert. {action} is now counter-trend."
+            f"[CONFIRM] ⚠️ {symbol} — {action} is counter-trend ({trend}) "
+            f"but TK Cross confirmed reversal — proceeding"
         )
-        del _alerts[symbol]
-        db_delete_alert(symbol)
-        return None
     
     # ── Re-check Kijun gate at confirmation time ──
     if action == "BUY" and kijun > 0:
@@ -843,10 +854,12 @@ def check_confirmation(symbol: str, klines: List[dict], mark_price: float = 0) -
     sl_pct = sl_distance / price * 100
     regime = "LATERAL" if adx < ADX_THRESHOLD else "TRENDING"
     
+    trend_label = "WITH-TREND" if with_trend else "COUNTER-TREND"
+    
     logger.info(
         f"[SIGNAL] 🎯 {action} {symbol} @ ${price:,.2f} | "
         f"TK Cross confirmed | Kijun TP=${kijun:,.2f} | "
-        f"SL=${sl:,.2f} ({sl_pct:.2f}%) | {trend} {regime} [WITH-TREND] | "
+        f"SL=${sl:,.2f} ({sl_pct:.2f}%) | {trend} {regime} [{trend_label}] | "
         f"Score={alert['confidence']}/100"
     )
     
@@ -865,7 +878,7 @@ def check_confirmation(symbol: str, klines: List[dict], mark_price: float = 0) -
         "adx": adx,
         "atr": atr,
         "trend": trend,
-        "trend_label": "WITH",
+        "trend_label": trend_label,
         "regime": regime,
         "confidence": alert["confidence"],
         "kijun_tp": kijun,
@@ -1196,10 +1209,10 @@ def tg_close_alert(symbol: str, pos: dict, close_price: float, pnl: float, reaso
 
 def tg_startup(balance: float):
     tg_send(
-        f"👻 <b>PHANTOM v2.0 iniciado</b>\n"
+        f"👻 <b>PHANTOM v2.1 iniciado</b>\n"
         f"{'━' * 24}\n"
         f"Estrategia: Mean-Reversion (RSI2 + Z-Score)\n"
-        f"Trend: BIAS (no bloquea counter-trend)\n"
+        f"Trend: Counter-trend allowed (TK Cross filters)\n"
         f"Timeframe: {KLINE_TIMEFRAME} | Eval: {EVAL_INTERVAL//60}min\n"
         f"Activos: {', '.join(CRYPTO_PAIRS)} + {STOCK_SYMBOL}\n"
         f"Balance: ${balance:,.2f}\n"
@@ -1271,13 +1284,13 @@ def main_loop():
     
     _start_balance = get_balance()
     logger.info("=" * 60)
-    logger.info("PHANTOM v2.0 — Wino and Company")
+    logger.info("PHANTOM v2.1 — Wino and Company")
     logger.info(f"Balance: ${_start_balance:,.2f}")
     logger.info(f"Activos: {CRYPTO_PAIRS} + {STOCK_SYMBOL}")
     logger.info(f"Estrategia: Mean-Reversion + TK Cross Confirmation")
     logger.info(f"Timeframe: {KLINE_TIMEFRAME} | Eval cada {EVAL_INTERVAL//60} min | SL ATR×{ATR_SL_MULT}")
     logger.info(f"Thresholds: RSI<{RSI_OVERSOLD}/{RSI_OVERBOUGHT}> | Z>{ZSCORE_THRESHOLD}σ | ADX<{ADX_THRESHOLD}")
-    logger.info(f"Counter-trend: {'ALLOWED' if ALLOW_COUNTER_TREND else 'BLOCKED'}")
+    logger.info(f"Counter-trend: ALLOWED (TK Cross filters)")
     logger.info(f"Kijun gate: {KIJUN_GATE_PCT:.0%} max distance | TK Cross timeout: {ALERT_TIMEOUT_SECONDS//3600}h")
     logger.info(f"Exit priority: Kijun TP → RSI exit → SL")
     logger.info(f"Min Confidence: {MIN_CONFIDENCE} | Persistence: SQLite")
