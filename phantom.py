@@ -1192,7 +1192,7 @@ def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: s
     
     # Score visual bar
     filled = round(conf / 10)
-    bar = "█" * filled + "░" * (10 - filled)
+    bar = "🟩" * filled + "⬜" * (10 - filled)
     
     # Pronostico basado en score
     if conf >= 80:
@@ -1215,7 +1215,7 @@ def tg_trade_alert(signal: dict, fill: float, sl: float, margin: float, venue: s
         f"📈 RSI(2):  {signal['rsi']:.1f}\n"
         f"📐 Z-Score: {signal['zscore']:+.2f}σ\n"
         f"📊 ADX:     {signal['adx']:.1f} ({signal['regime']})\n"
-        f"📈 Trend:   {signal['trend']} [{signal.get('trend_label', 'N/A')}-TREND]\n"
+        f"📈 Trend:   {signal['trend']} [{signal.get('trend_label', 'N/A')}]\n"
         f"{'━' * 24}\n"
         f"🎯 Score:   {conf}/100 [{bar}]\n"
         f"🔮 Pronóstico: {pronostico}\n"
