@@ -1,9 +1,22 @@
 """
-phantom.py — Phantom Bot v2.1
+phantom.py — Phantom Bot v2.2
 Wino and Company · Junio 2026
 
 ESTRATEGIA: Statistical Mean-Reversion con Confirmación Estructural
 ═════════════════════════════════════════════════════════════════════
+
+v2.2 CHANGELOG (29-Jun-2026) — Kijun gate dinámica + TK lookback:
+  EVIDENCIA: v2.1 produjo 275 evaluaciones → 275 Kijun gate blocks, 1 alert,
+  0 trades en 36 horas. Gate fija de 3% bloquea exactamente las condiciones
+  que mean-reversion necesita (precio extendido lejos del equilibrio).
+  SOL tuvo un alert pero TK Cross ya había ocurrido antes — no se detectó.
+
+  CAMBIOS:
+  - Kijun gate: 3% fijo → 6×ATR/price (dinámica, se adapta a volatilidad)
+    En mercados calmados gate se aprieta, en volátiles se abre
+  - TK Cross: lookback de 1 barra → 5 barras. Si el crossover ocurrió
+    en las últimas 5 velas, cuenta como confirmación válida
+  - Todos los demás parámetros sin cambios
 
 v2.1 CHANGELOG (27-Jun-2026) — Phase 2 enablement:
   EVIDENCIA: v2.0 ALLOW_COUNTER_TREND=False bloqueó 100% de señales
@@ -98,7 +111,8 @@ ADX_THRESHOLD     = 40      # ADX < 40 = lateral + semi-trending (v1.2: era 30)
 ALLOW_COUNTER_TREND    = False   # v2.0: bloqueado (7/7 counter-trend = losses)
 KIJUN_PERIOD           = 26      # Kijun-sen: (HH+LL)/2 de 26 períodos
 TENKAN_PERIOD          = 9       # Tenkan-sen: (HH+LL)/2 de 9 períodos
-KIJUN_GATE_PCT         = 0.03    # No LONG si precio > 3% debajo de Kijun
+KIJUN_GATE_ATR_MULT    = 6.0     # v2.2: gate = 6×ATR/price (dinámica, reemplaza 3% fijo)
+TK_CROSS_LOOKBACK      = 5       # v2.2: buscar TK cross en últimas 5 velas (no solo la anterior)
 ALERT_TIMEOUT_SECONDS  = 48 * 3600  # 48 horas para confirmación TK Cross
 
 # ── Risk Management ──
@@ -662,24 +676,25 @@ def evaluate(symbol: str, klines: List[dict], mark_price: float = 0) -> Optional
             f"allowed, TK Cross must confirm reversal in Phase 2"
         )
     
-    # ── v2.0: Kijun gate ──
-    if kijun > 0:
+    # ── v2.2: Kijun gate (dinámica = 6×ATR / price) ──
+    if kijun > 0 and atr > 0:
+        kijun_gate_pct = (atr * KIJUN_GATE_ATR_MULT) / price
         if action == "BUY":
             kijun_dist = (kijun - price) / kijun
-            if kijun_dist > KIJUN_GATE_PCT:
+            if kijun_dist > kijun_gate_pct:
                 logger.info(
                     f"[EVAL] {symbol} BLOCKED — KIJUN GATE | "
                     f"Price ${price:,.2f} is {kijun_dist:.1%} below Kijun ${kijun:,.2f} "
-                    f"(max {KIJUN_GATE_PCT:.0%})"
+                    f"(max {kijun_gate_pct:.1%} = 6×ATR)"
                 )
                 return None
         elif action == "SELL":
             kijun_dist = (price - kijun) / kijun
-            if kijun_dist > KIJUN_GATE_PCT:
+            if kijun_dist > kijun_gate_pct:
                 logger.info(
                     f"[EVAL] {symbol} BLOCKED — KIJUN GATE | "
                     f"Price ${price:,.2f} is {kijun_dist:.1%} above Kijun ${kijun:,.2f} "
-                    f"(max {KIJUN_GATE_PCT:.0%})"
+                    f"(max {kijun_gate_pct:.1%} = 6×ATR)"
                 )
                 return None
     
@@ -777,34 +792,46 @@ def check_confirmation(symbol: str, klines: List[dict], mark_price: float = 0) -
     if tenkan <= 0 or kijun <= 0:
         return None
     
-    # ── Calcular Tenkan y Kijun del bar anterior ──
-    prev_klines = klines[:-1]
-    if len(prev_klines) < KIJUN_PERIOD:
-        return None
-    prev_tenkan = calc_tenkan(prev_klines)
-    prev_kijun = calc_kijun(prev_klines)
-    
-    if prev_tenkan <= 0 or prev_kijun <= 0:
-        return None
-    
-    # ── TK Cross detection ──
+    # ── v2.2: TK Cross detection with lookback window ──
     action = alert["action"]
     confirmed = False
     
-    if action == "BUY" and prev_tenkan <= prev_kijun and tenkan > kijun:
-        confirmed = True
-        logger.info(
-            f"[CONFIRM] ✅ TK Cross BULLISH {symbol} | "
-            f"Tenkan={tenkan:,.2f} crossed above Kijun={kijun:,.2f}"
-        )
-    elif action == "SELL" and prev_tenkan >= prev_kijun and tenkan < kijun:
-        confirmed = True
-        logger.info(
-            f"[CONFIRM] ✅ TK Cross BEARISH {symbol} | "
-            f"Tenkan={tenkan:,.2f} crossed below Kijun={kijun:,.2f}"
-        )
+    for lb in range(1, TK_CROSS_LOOKBACK + 1):
+        if len(klines) < KIJUN_PERIOD + lb + 1:
+            break
+        slice_curr = klines[:-(lb - 1)] if lb > 1 else klines
+        slice_prev = klines[:-lb]
+        
+        lb_tenkan = calc_tenkan(slice_curr)
+        lb_kijun = calc_kijun(slice_curr)
+        lb_prev_tenkan = calc_tenkan(slice_prev)
+        lb_prev_kijun = calc_kijun(slice_prev)
+        
+        if lb_tenkan <= 0 or lb_kijun <= 0 or lb_prev_tenkan <= 0 or lb_prev_kijun <= 0:
+            continue
+        
+        if action == "BUY" and lb_prev_tenkan <= lb_prev_kijun and lb_tenkan > lb_kijun:
+            confirmed = True
+            logger.info(
+                f"[CONFIRM] ✅ TK Cross BULLISH {symbol} | "
+                f"Tenkan={tenkan:,.2f} > Kijun={kijun:,.2f} | "
+                f"crossover detected {lb} bar(s) ago"
+            )
+            break
+        elif action == "SELL" and lb_prev_tenkan >= lb_prev_kijun and lb_tenkan < lb_kijun:
+            confirmed = True
+            logger.info(
+                f"[CONFIRM] ✅ TK Cross BEARISH {symbol} | "
+                f"Tenkan={tenkan:,.2f} < Kijun={kijun:,.2f} | "
+                f"crossover detected {lb} bar(s) ago"
+            )
+            break
     
     if not confirmed:
+        logger.info(
+            f"[CONFIRM] ⏳ {symbol} — No TK Cross in last {TK_CROSS_LOOKBACK} bars | "
+            f"Tenkan={tenkan:,.2f} Kijun={kijun:,.2f} | waiting..."
+        )
         return None
     
     # ── Re-check trend at confirmation time ──
@@ -824,23 +851,27 @@ def check_confirmation(symbol: str, klines: List[dict], mark_price: float = 0) -
             f"but TK Cross confirmed reversal — proceeding"
         )
     
-    # ── Re-check Kijun gate at confirmation time ──
+    # ── v2.2: Re-check Kijun gate (dinámica = 6×ATR / price) ──
+    conf_atr = calc_atr(klines)
+    kijun_gate_pct = (conf_atr * KIJUN_GATE_ATR_MULT) / price if conf_atr > 0 else 0.03
     if action == "BUY" and kijun > 0:
         kijun_dist = (kijun - price) / kijun
-        if kijun_dist > KIJUN_GATE_PCT:
+        if kijun_dist > kijun_gate_pct:
             logger.info(
                 f"[CONFIRM] ❌ ABORT {symbol} — KIJUN GATE failed at confirmation | "
-                f"Price ${price:,.2f} is {kijun_dist:.1%} below Kijun ${kijun:,.2f}"
+                f"Price ${price:,.2f} is {kijun_dist:.1%} below Kijun ${kijun:,.2f} "
+                f"(max {kijun_gate_pct:.1%} = 6×ATR)"
             )
             del _alerts[symbol]
             db_delete_alert(symbol)
             return None
     elif action == "SELL" and kijun > 0:
         kijun_dist = (price - kijun) / kijun
-        if kijun_dist > KIJUN_GATE_PCT:
+        if kijun_dist > kijun_gate_pct:
             logger.info(
                 f"[CONFIRM] ❌ ABORT {symbol} — KIJUN GATE failed at confirmation | "
-                f"Price ${price:,.2f} is {kijun_dist:.1%} above Kijun ${kijun:,.2f}"
+                f"Price ${price:,.2f} is {kijun_dist:.1%} above Kijun ${kijun:,.2f} "
+                f"(max {kijun_gate_pct:.1%} = 6×ATR)"
             )
             del _alerts[symbol]
             db_delete_alert(symbol)
@@ -1209,7 +1240,7 @@ def tg_close_alert(symbol: str, pos: dict, close_price: float, pnl: float, reaso
 
 def tg_startup(balance: float):
     tg_send(
-        f"👻 <b>PHANTOM v2.1 iniciado</b>\n"
+        f"👻 <b>PHANTOM v2.2 iniciado</b>\n"
         f"{'━' * 24}\n"
         f"Estrategia: Mean-Reversion (RSI2 + Z-Score)\n"
         f"Trend: Counter-trend allowed (TK Cross filters)\n"
@@ -1284,14 +1315,14 @@ def main_loop():
     
     _start_balance = get_balance()
     logger.info("=" * 60)
-    logger.info("PHANTOM v2.1 — Wino and Company")
+    logger.info("PHANTOM v2.2 — Wino and Company")
     logger.info(f"Balance: ${_start_balance:,.2f}")
     logger.info(f"Activos: {CRYPTO_PAIRS} + {STOCK_SYMBOL}")
     logger.info(f"Estrategia: Mean-Reversion + TK Cross Confirmation")
     logger.info(f"Timeframe: {KLINE_TIMEFRAME} | Eval cada {EVAL_INTERVAL//60} min | SL ATR×{ATR_SL_MULT}")
     logger.info(f"Thresholds: RSI<{RSI_OVERSOLD}/{RSI_OVERBOUGHT}> | Z>{ZSCORE_THRESHOLD}σ | ADX<{ADX_THRESHOLD}")
     logger.info(f"Counter-trend: ALLOWED (TK Cross filters)")
-    logger.info(f"Kijun gate: {KIJUN_GATE_PCT:.0%} max distance | TK Cross timeout: {ALERT_TIMEOUT_SECONDS//3600}h")
+    logger.info(f"Kijun gate: 6×ATR dynamic | TK Cross: {TK_CROSS_LOOKBACK}-bar lookback | timeout: {ALERT_TIMEOUT_SECONDS//3600}h")
     logger.info(f"Exit priority: Kijun TP → RSI exit → SL")
     logger.info(f"Min Confidence: {MIN_CONFIDENCE} | Persistence: SQLite")
     logger.info("=" * 60)
